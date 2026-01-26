@@ -1,0 +1,105 @@
+{
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "0661351e-8498-4d9c-ad42-eb2d514b30c7",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [-640, -64],
+      "id": "961d03db-cada-40ed-b1c0-2e4fa2b7d35e",
+      "name": "Webhook",
+      "webhookId": "0661351e-8498-4d9c-ad42-eb2d514b30c7"
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "value": "1oFVfFVcqBA0vEZRKqPvstyHM3DTqYEUfkG9YiXMZEps",
+          "mode": "list",
+          "cachedResultName": "Jobportal_sheets",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/1oFVfFVcqBA0vEZRKqPvstyHM3DTqYEUfkG9YiXMZEps/edit?usp=drivesdk"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "gid=0",
+          "mode": "list",
+          "cachedResultName": "Tabellenblatt1",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/1oFVfFVcqBA0vEZRKqPvstyHM3DTqYEUfkG9YiXMZEps/edit#gid=0"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "Branche": "={{ $('Webhook').item.json.body.category }}",
+            "Firma": "={{ $json.company.name }}",
+            "Beschreibung": "={{ $('Webhook').item.json.body.description }}",
+            "Jobname": "={{ $json.job_title }}",
+            "Ansprechpartner": "={{ $json.decision_maker ? $json.decision_maker.name + ' (' + ($json.decision_maker.title || '') + ')' : '' }}",
+            "Email": "={{ $json.decision_maker?.email || $json.emails?.[0] || '' }}",
+            "Telefon": "={{ $json.phone?.number || $json.company?.phone || '' }}",
+            "URL": "={{ $('Webhook').item.json.body.url }}",
+            "Ort": "={{ $json.company.location || $('Webhook').item.json.body.location }}",
+            "Datum": "={{ $('Webhook').item.json.body.date_posted }}",
+            "Sales_Brief": "={{ $json.company_intel?.summary || '' }}"
+          },
+          "matchingColumns": [],
+          "schema": [
+            {"id": "Jobname", "displayName": "Jobname", "required": false, "defaultMatch": false, "display": true, "type": "string", "canBeUsedToMatch": true},
+            {"id": "Beschreibung", "displayName": "Beschreibung", "required": false, "defaultMatch": false, "display": true, "type": "string", "canBeUsedToMatch": true},
+            {"id": "Ansprechpartner", "displayName": "Ansprechpartner", "required": false, "defaultMatch": false, "display": true, "type": "string", "canBeUsedToMatch": true},
+            {"id": "Email", "displayName": "Email", "required": false, "defaultMatch": false, "display": true, "type": "string", "canBeUsedToMatch": true},
+            {"id": "Telefon", "displayName": "Telefon", "required": false, "defaultMatch": false, "display": true, "type": "string", "canBeUsedToMatch": true},
+            {"id": "Branche", "displayName": "Branche", "required": false, "defaultMatch": false, "display": true, "type": "string", "canBeUsedToMatch": true},
+            {"id": "Firma", "displayName": "Firma", "required": false, "defaultMatch": false, "display": true, "type": "string", "canBeUsedToMatch": true},
+            {"id": "URL", "displayName": "URL", "required": false, "defaultMatch": false, "display": true, "type": "string", "canBeUsedToMatch": true},
+            {"id": "Datum", "displayName": "Datum", "required": false, "defaultMatch": false, "display": true, "type": "string", "canBeUsedToMatch": true},
+            {"id": "Ort", "displayName": "Ort", "required": false, "defaultMatch": false, "display": true, "type": "string", "canBeUsedToMatch": true},
+            {"id": "Sales_Brief", "displayName": "Sales_Brief", "required": false, "defaultMatch": false, "display": true, "type": "string", "canBeUsedToMatch": true}
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.7,
+      "position": [96, -64],
+      "id": "553d2b4e-1cbd-4087-8f7c-7ec55b3a6454",
+      "name": "Append row in sheet",
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "4Xc4sLssHtLRzsi3",
+          "name": "Niklas_sheets"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://91.99.149.237:8070/webhook/enrich/sync",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({\n  category: $json.body.jobs?.[0]?.category || $json.body.category,\n  company: $json.body.company || $json.body.jobs?.[0]?.company,\n  date_posted: $json.body.jobs?.[0]?.date_posted || $json.body.date_posted,\n  description: $json.body.jobs?.[0]?.description || $json.body.description,\n  id: $json.body.jobs?.[0]?.id || $json.body.id,\n  location: $json.body.jobs?.[0]?.location || $json.body.location,\n  source: $json.body.jobs?.[0]?.source || $json.body.source,\n  title: $json.body.jobs?.[0]?.title || $json.body.title,\n  url: $json.body.jobs?.[0]?.url || $json.body.url\n}) }}",
+        "options": {
+          "timeout": 120000
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.3,
+      "position": [-256, -64],
+      "id": "5c9dbe88-8245-420a-8a79-dca31d4d7e79",
+      "name": "data_enrichment2"
+    }
+  ],
+  "connections": {
+    "Webhook": {
+      "main": [[{"node": "data_enrichment2", "type": "main", "index": 0}]]
+    },
+    "data_enrichment2": {
+      "main": [[{"node": "Append row in sheet", "type": "main", "index": 0}]]
+    }
+  }
+}
