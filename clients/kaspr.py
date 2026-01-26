@@ -11,10 +11,6 @@ logger = logging.getLogger(__name__)
 
 KASPR_BASE_URL = "https://api.developers.kaspr.io"
 
-# Singleton instance to persist state across calls
-_kaspr_instance = None
-
-
 @dataclass
 class KasprResult:
     """Result from Kaspr enrichment."""
@@ -24,13 +20,17 @@ class KasprResult:
 
 
 class KasprClient:
-    """Kaspr API client for phone enrichment via LinkedIn."""
+    """
+    Kaspr API client for phone enrichment via LinkedIn.
+
+    Note: Each request creates a fresh client to avoid global state issues.
+    API availability is checked per-request, not cached globally.
+    """
 
     def __init__(self):
         settings = get_settings()
         self.api_key = settings.kaspr_api_key
         self.timeout = settings.api_timeout
-        self._api_disabled = False  # Track if API is unavailable (no credits, etc.)
 
     async def enrich_by_linkedin(
         self,
@@ -47,10 +47,6 @@ class KasprClient:
         """
         if not self.api_key:
             logger.warning("Kaspr API key not configured")
-            return None
-
-        if self._api_disabled:
-            logger.warning("Kaspr API disabled (no credits or rate limited)")
             return None
 
         # Extract LinkedIn ID from URL
@@ -156,10 +152,10 @@ class KasprClient:
                 status_code = e.response.status_code
                 logger.error(f"Kaspr API error: {status_code} - {e.response.text}")
 
-                # Disable API on payment/auth errors to prevent repeated failed calls
+                # Log payment/auth errors but don't disable globally
+                # Each request should try fresh
                 if status_code in (402, 403, 401):
-                    self._api_disabled = True
-                    logger.error(f"Kaspr API disabled for this session (status {status_code})")
+                    logger.error(f"Kaspr API auth/payment error (status {status_code}) - check billing")
 
                 return None
             except Exception as e:
@@ -213,12 +209,10 @@ class KasprClient:
 
 
 def get_kaspr_client() -> KasprClient:
-    """Get singleton Kaspr client instance.
-
-    This ensures the _api_disabled flag persists across calls,
-    preventing repeated failed API calls when credits are exhausted.
     """
-    global _kaspr_instance
-    if _kaspr_instance is None:
-        _kaspr_instance = KasprClient()
-    return _kaspr_instance
+    Get a fresh Kaspr client instance.
+
+    Creates new instance per request to avoid global state issues
+    when handling concurrent requests.
+    """
+    return KasprClient()

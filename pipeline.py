@@ -61,6 +61,12 @@ from utils.cost_tracker import (
 logger = logging.getLogger(__name__)
 
 
+def _safe_first_name(name: str) -> str:
+    """Extract first name safely, return 'unknown' if empty."""
+    parts = (name or "").split()
+    return parts[0] if parts else "unknown"
+
+
 def _is_valid_dach_phone(number: str) -> bool:
     """
     Check if phone number is a valid DACH phone number.
@@ -129,7 +135,8 @@ async def enrich_lead(
     # Step 1: Parse job posting with Claude
     parsed = await parse_job_posting(payload)
     track_llm("job_parse", tier="sonnet")  # Job parsing uses Sonnet
-    logger.info(f"LLM extracted: domain={parsed.company_domain}, contact={parsed.contact_name}, phone={parsed.contact_phone}")
+    # Log without sensitive data (phone numbers)
+    logger.info(f"LLM extracted: domain={parsed.company_domain}, contact={parsed.contact_name}, has_phone={bool(parsed.contact_phone)}")
 
     # Create company info
     company_info = CompanyInfo(
@@ -255,7 +262,7 @@ async def enrich_lead(
     # Priority 2: Contact from LLM parsing
     if parsed.contact_name:
         # Don't add if already have from job URL
-        if not any(c["name"].lower() == parsed.contact_name.lower() for c in all_candidates):
+        if not any(c.get("name", "").lower() == parsed.contact_name.lower() for c in all_candidates):
             all_candidates.append({
                 "name": parsed.contact_name,
                 "email": parsed.contact_email,
@@ -278,7 +285,7 @@ async def enrich_lead(
         team_priority = 50 if team_result.fallback_used else 70  # Lower priority for fallback
 
         for contact in team_result.contacts:
-            if not any(c["name"].lower() == contact.name.lower() for c in all_candidates):
+            if contact.name and not any(c.get("name", "").lower() == contact.name.lower() for c in all_candidates):
                 all_candidates.append({
                     "name": contact.name,
                     "email": contact.email,
@@ -294,7 +301,7 @@ async def enrich_lead(
     # Priority 4: Executives from Impressum
     if impressum_result and impressum_result.executives:
         for exec_contact in impressum_result.executives:
-            if not any(c["name"].lower() == exec_contact.name.lower() for c in all_candidates):
+            if exec_contact.name and not any(c.get("name", "").lower() == exec_contact.name.lower() for c in all_candidates):
                 all_candidates.append({
                     "name": exec_contact.name,
                     "title": exec_contact.title,
@@ -354,7 +361,7 @@ async def enrich_lead(
 
     for candidate in top_candidates:
         candidate_data = next(
-            (c for c in all_candidates if c["name"].lower() == candidate.name.lower()),
+            (c for c in all_candidates if c.get("name", "").lower() == (candidate.name or "").lower()),
             {}
         )
 
@@ -373,28 +380,62 @@ async def enrich_lead(
             )
             if found_url:
                 linkedin_url = found_url
-                enrichment_path.append(f"linkedin_found_{candidate.name.split()[0]}")
+                enrichment_path.append(f"linkedin_found_{_safe_first_name(candidate.name)}")
                 logger.info(f"Found LinkedIn: {found_url}")
+
+        # Step 1b: AI Name-Matching - intelligently check if LinkedIn matches person
+        if linkedin_url:
+            try:
+                linkedin_slug = linkedin_url.split("/in/")[-1].rstrip("/")
+                name_match = await ai_match_linkedin_to_name(
+                    linkedin_slug=linkedin_slug,
+                    person_name=candidate.name,
+                    company_name=parsed.company_name
+                )
+                # AI decides intelligently - only discard on clear mismatch
+                if not name_match.get("matches"):
+                    logger.warning(f"AI: LinkedIn doesn't match: {linkedin_url} vs {candidate.name} - {name_match.get('reason', 'no reason')}")
+                    enrichment_path.append(f"ai_name_mismatch_{_safe_first_name(candidate.name)}")
+                    linkedin_url = None  # Discard non-matching LinkedIn
+                else:
+                    logger.info(f"AI: LinkedIn name match confirmed: {linkedin_slug} -> {candidate.name}")
+                    enrichment_path.append(f"ai_name_match_{_safe_first_name(candidate.name)}")
+            except Exception as e:
+                logger.warning(f"AI name matching failed: {e} - continuing with LinkedIn URL")
+                # On error, continue with LinkedIn URL (will be verified by Apify anyway)
 
         # Step 2: Verify LinkedIn URL with Apify (for ALL candidates with LinkedIn)
         if linkedin_url:
             logger.info(f"Verifying LinkedIn for: {candidate.name} at {parsed.company_name}")
 
-            verification = await apify_client.verify_employment(
-                linkedin_url=linkedin_url,
-                expected_company=parsed.company_name
-            )
-            track_apify(success=True)
+            try:
+                verification = await apify_client.verify_employment(
+                    linkedin_url=linkedin_url,
+                    expected_company=parsed.company_name
+                )
+                track_apify(success=True)
+                enrichment_path.append(f"apify_verify_{_safe_first_name(candidate.name)}")
+            except Exception as e:
+                logger.warning(f"Apify verification failed for {candidate.name}: {e}")
+                track_apify(success=False)
+                # Treat failed verification as not verified - continue without LinkedIn
+                linkedin_url = None
+                candidate_data["linkedin_url"] = None
+                candidate_data["linkedin_verified"] = False
+                candidate_data["verification_note"] = f"Apify-Fehler: {str(e)}"
+                enrichment_path.append(f"apify_error_{_safe_first_name(candidate.name)}")
+                # Skip to decision step (is_trusted check below)
+                verification = None
 
-            enrichment_path.append(f"apify_verify_{candidate.name.split()[0]}")
-
-            if verification.is_currently_employed:
+            if verification is None:
+                pass  # Skip verification logic, already handled above
+            elif verification.is_currently_employed:
                 # LinkedIn verified: Name matches AND currently employed
                 linkedin_verified = True
                 candidate_data["linkedin_url"] = linkedin_url
                 candidate_data["linkedin_verified"] = True
                 candidate_data["verification_note"] = verification.verification_note
-                enrichment_path.append(f"linkedin_verified_{candidate.name.split()[0]}")
+                enrichment_path.append(f"linkedin_verified_{_safe_first_name(candidate.name)}")
                 logger.info(f"LINKEDIN VERIFIED: {candidate.name} - {verification.verification_note}")
             else:
                 # LinkedIn NOT verified: Wrong person or not employed there
@@ -403,7 +444,7 @@ async def enrich_lead(
                 candidate_data["linkedin_url"] = None  # Remove invalid LinkedIn
                 candidate_data["linkedin_verified"] = False
                 candidate_data["verification_note"] = f"LinkedIn verworfen: {verification.verification_note}"
-                enrichment_path.append(f"linkedin_discarded_{candidate.name.split()[0]}")
+                enrichment_path.append(f"linkedin_discarded_{_safe_first_name(candidate.name)}")
                 logger.warning(f"LINKEDIN DISCARDED: {candidate.name} - {verification.verification_note}")
 
         # Step 3: Decide if candidate should be kept
@@ -423,7 +464,7 @@ async def enrich_lead(
             candidate_data["verified_current"] = True
             candidate_data["verification_note"] = note
             verified_candidates.append(candidate)
-            enrichment_path.append(f"trusted_{candidate.name.split()[0]}")
+            enrichment_path.append(f"trusted_{_safe_first_name(candidate.name)}")
             logger.info(f"TRUSTED SOURCE: {candidate.name} - {note}")
 
         else:
@@ -431,13 +472,13 @@ async def enrich_lead(
             if linkedin_verified:
                 candidate_data["verified_current"] = True
                 verified_candidates.append(candidate)
-                enrichment_path.append(f"fallback_verified_{candidate.name.split()[0]}")
+                enrichment_path.append(f"fallback_verified_{_safe_first_name(candidate.name)}")
                 logger.info(f"FALLBACK VERIFIED: {candidate.name} - LinkedIn bestätigt")
             else:
                 # No verified LinkedIn = no proof they work there = skip
                 candidate_data["verified_current"] = False
                 candidate_data["verification_note"] = "LinkedIn-Fallback ohne Verifizierung - übersprungen"
-                enrichment_path.append(f"fallback_skipped_{candidate.name.split()[0]}")
+                enrichment_path.append(f"fallback_skipped_{_safe_first_name(candidate.name)}")
                 logger.warning(f"FALLBACK SKIPPED: {candidate.name} - kein verifiziertes LinkedIn")
 
     # Use verified candidates for phone enrichment
@@ -456,7 +497,7 @@ async def enrich_lead(
     # First: Check if any candidate already has a phone from input
     for candidate in top_candidates:
         candidate_data = next(
-            (c for c in all_candidates if c["name"].lower() == candidate.name.lower()),
+            (c for c in all_candidates if c.get("name", "").lower() == (candidate.name or "").lower()),
             {}
         )
         input_phone = candidate_data.get("phone")
@@ -469,13 +510,15 @@ async def enrich_lead(
                 source=PhoneSource.COMPANY_MAIN,  # From job posting
                 context_note="Direkt aus Stellenanzeige - wahrscheinlich geschäftlich"
             )
-            names = candidate.name.split()
+            names = candidate.name.split() if candidate.name else []
+            # Only include LinkedIn URL if verified - unverified URLs are worthless
+            verified_linkedin = candidate_data.get("linkedin_url") if candidate_data.get("linkedin_verified") else None
             decision_maker = DecisionMaker(
                 name=candidate.name,
                 first_name=names[0] if names else "",
                 last_name=" ".join(names[1:]) if len(names) > 1 else "",
                 title=candidate_data.get("title"),
-                linkedin_url=candidate_data.get("linkedin_url"),
+                linkedin_url=verified_linkedin,
                 email=candidate.email or candidate_data.get("email"),
                 verified_current=candidate_data.get("verified_current", False),
                 verification_note=candidate_data.get("verification_note")
@@ -489,11 +532,11 @@ async def enrich_lead(
 
         for idx, candidate in enumerate(top_candidates):
             candidate_data = next(
-                (c for c in all_candidates if c["name"].lower() == candidate.name.lower()),
+                (c for c in all_candidates if c.get("name", "").lower() == (candidate.name or "").lower()),
                 {}
             )
 
-            names = candidate.name.split()
+            names = (candidate.name or "").split()
             first_name = names[0] if names else ""
             last_name = " ".join(names[1:]) if len(names) > 1 else ""
 
@@ -528,8 +571,8 @@ async def enrich_lead(
                 )
                 collected_emails.extend(fe_emails)
 
-            # Try Kaspr if no phone and have LinkedIn
-            if not phone_result and linkedin_url:
+            # Try Kaspr ONLY if have VERIFIED LinkedIn (Kaspr needs LinkedIn)
+            if not phone_result and linkedin_url and candidate_data.get("linkedin_verified"):
                 phone_result, kaspr_emails = await _try_kaspr(
                     linkedin_url=linkedin_url,
                     name=candidate.name,
@@ -539,35 +582,39 @@ async def enrich_lead(
 
             if phone_result:
                 # Found phone - create decision maker with verification status
+                # Only include LinkedIn URL if verified - unverified URLs are worthless
+                verified_linkedin = linkedin_url if candidate_data.get("linkedin_verified") else None
                 decision_maker = DecisionMaker(
                     name=candidate.name,
                     first_name=first_name,
                     last_name=last_name,
                     title=candidate_data.get("title"),
-                    linkedin_url=linkedin_url,
+                    linkedin_url=verified_linkedin,
                     email=candidate.email or candidate_data.get("email"),
                     verified_current=candidate_data.get("verified_current", False),
                     verification_note=candidate_data.get("verification_note")
                 )
                 enrichment_path.append(f"phone_found_candidate_{idx+1}")
-                logger.info(f"Phone found: {phone_result.number}")
+                logger.info(f"Phone found via {phone_result.source.value}")
                 break
 
     # Fallback: Use best candidate even without phone
     if not decision_maker and top_candidates:
         best = top_candidates[0]
         candidate_data = next(
-            (c for c in all_candidates if c["name"].lower() == best.name.lower()),
+            (c for c in all_candidates if c.get("name", "").lower() == (best.name or "").lower()),
             {}
         )
 
-        names = best.name.split()
+        names = best.name.split() if best.name else []
+        # Only include LinkedIn URL if verified - unverified URLs are worthless
+        verified_linkedin = candidate_data.get("linkedin_url") if candidate_data.get("linkedin_verified") else None
         decision_maker = DecisionMaker(
             name=best.name,
             first_name=names[0] if names else "",
             last_name=" ".join(names[1:]) if len(names) > 1 else "",
             title=candidate_data.get("title"),
-            linkedin_url=candidate_data.get("linkedin_url"),
+            linkedin_url=verified_linkedin,
             email=best.email or candidate_data.get("email"),
             verified_current=candidate_data.get("verified_current", False),
             verification_note=candidate_data.get("verification_note")
@@ -632,7 +679,7 @@ async def enrich_lead(
 
     # Update decision maker email - ONLY assign email that actually belongs to this person
     if decision_maker and not decision_maker.email and unique_emails and company_info.domain:
-        company_domain = company_info.domain.lower().replace('www.', '')
+        company_domain = (company_info.domain or "").lower().strip().replace('www.', '')
 
         # Generic email prefixes to exclude
         generic_prefixes = (
@@ -1081,10 +1128,9 @@ def _extract_main_domain(domain: str) -> Optional[str]:
     base_name = parts[-2]  # company name part
 
     if tld in ('org', 'com', 'net'):
-        # Return .de variant for German companies
-        de_domain = f"{base_name}.de"
-        logger.info(f"Subdomain detected: {domain} -> trying main domain {de_domain} (DACH preference)")
-        return de_domain
+        # Keep original TLD - don't assume .de for AT/CH companies
+        logger.info(f"Subdomain detected: {domain} -> using main domain {main_domain}")
+        return main_domain
 
     return main_domain
 

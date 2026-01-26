@@ -75,11 +75,37 @@ Beschreibung:
     content = response.content[0].text
 
     # Extract JSON from response (Claude might add some text around it)
-    json_match = re.search(r'\{[^{}]*\}', content, re.DOTALL)
-    if json_match:
-        content = json_match.group()
+    # Support nested objects by finding balanced braces
+    content = content.strip()
 
-    data = json.loads(content)
+    # Remove markdown code blocks if present
+    if content.startswith("```json"):
+        content = content[7:]
+    elif content.startswith("```"):
+        content = content[3:]
+    if content.endswith("```"):
+        content = content[:-3]
+    content = content.strip()
+
+    # Try to parse directly first
+    try:
+        data = json.loads(content)
+    except json.JSONDecodeError:
+        # Find JSON object with balanced braces
+        start_idx = content.find('{')
+        if start_idx != -1:
+            brace_count = 0
+            end_idx = start_idx
+            for i, char in enumerate(content[start_idx:], start_idx):
+                if char == '{':
+                    brace_count += 1
+                elif char == '}':
+                    brace_count -= 1
+                    if brace_count == 0:
+                        end_idx = i + 1
+                        break
+            content = content[start_idx:end_idx]
+        data = json.loads(content)
 
     # Ensure target_titles has defaults if empty
     if not data.get("target_titles"):

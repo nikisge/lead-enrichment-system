@@ -20,10 +20,6 @@ logger = logging.getLogger(__name__)
 
 BETTERCONTACT_BASE_URL = "https://app.bettercontact.rocks/api/v2"
 
-# Singleton instance to persist state across calls
-_bettercontact_instance = None
-
-
 @dataclass
 class BetterContactResult:
     """Result from BetterContact enrichment."""
@@ -38,6 +34,8 @@ class BetterContactClient:
 
     Tries 20+ data providers in sequence to maximize hit rate.
     Costs: ~1 credit per successful enrichment
+
+    Note: Each request creates a fresh client to avoid global state issues.
     """
 
     def __init__(self):
@@ -46,17 +44,11 @@ class BetterContactClient:
         self.timeout = settings.api_timeout
         self.max_poll_attempts = 20  # Max 40 seconds polling
         self.poll_interval = 2  # seconds
-        self._api_disabled = False  # Track if API is unavailable
-        self._credits_checked = False
-        self._has_credits = True
 
     async def check_credits(self) -> bool:
         """Check if we have credits available."""
         if not self.api_key:
             return False
-
-        if self._credits_checked:
-            return self._has_credits
 
         try:
             async with httpx.AsyncClient(timeout=self.timeout) as client:
@@ -68,21 +60,16 @@ class BetterContactClient:
                 data = response.json()
 
                 credits_left = data.get("credits_left", 0)
-                self._credits_checked = True
-                self._has_credits = credits_left > 0
-
                 logger.info(f"BetterContact credits: {credits_left}")
 
-                if not self._has_credits:
-                    self._api_disabled = True
+                if credits_left <= 0:
                     logger.warning("BetterContact: No credits available")
+                    return False
 
-                return self._has_credits
+                return True
 
         except Exception as e:
             logger.warning(f"BetterContact credit check failed: {e}")
-            self._credits_checked = True
-            self._has_credits = False
             return False
 
     async def enrich(
@@ -109,16 +96,6 @@ class BetterContactClient:
         if not self.api_key:
             logger.warning("BetterContact API key not configured")
             return None
-
-        if self._api_disabled:
-            logger.warning("BetterContact API disabled (no credits)")
-            return None
-
-        # Check credits on first call
-        if not self._credits_checked:
-            has_credits = await self.check_credits()
-            if not has_credits:
-                return None
 
         if not company_name and not domain:
             logger.warning("BetterContact requires company_name or domain")
@@ -184,10 +161,9 @@ class BetterContactClient:
                 status_code = e.response.status_code
                 logger.error(f"BetterContact start error: {status_code} - {e.response.text}")
 
-                # Handle payment/credit issues
+                # Log payment/credit issues but don't disable globally
                 if status_code in (402, 403, 429):
-                    self._api_disabled = True
-                    logger.error(f"BetterContact API disabled (status {status_code})")
+                    logger.error(f"BetterContact API auth/payment error (status {status_code}) - check billing")
 
                 return None
             except Exception as e:
@@ -225,8 +201,7 @@ class BetterContactClient:
 
                     # Immediately stop on payment/auth errors
                     if status_code in (402, 403, 401):
-                        logger.error(f"BetterContact API error {status_code} - stopping")
-                        self._api_disabled = True
+                        logger.error(f"BetterContact API error {status_code} - check billing")
                         return None
 
                     if attempt >= 3:
@@ -317,8 +292,10 @@ class BetterContactClient:
 
 
 def get_bettercontact_client() -> BetterContactClient:
-    """Get singleton BetterContact client instance."""
-    global _bettercontact_instance
-    if _bettercontact_instance is None:
-        _bettercontact_instance = BetterContactClient()
-    return _bettercontact_instance
+    """
+    Get a fresh BetterContact client instance.
+
+    Creates new instance per request to avoid global state issues
+    when handling concurrent requests.
+    """
+    return BetterContactClient()

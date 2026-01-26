@@ -11,10 +11,6 @@ logger = logging.getLogger(__name__)
 
 FULLENRICH_BASE_URL = "https://app.fullenrich.com/api/v1"
 
-# Singleton instance to persist state across calls
-_fullenrich_instance = None
-
-
 @dataclass
 class FullEnrichResult:
     """Result from FullEnrich enrichment."""
@@ -29,6 +25,8 @@ class FullEnrichClient:
     FullEnrich API client for phone/email enrichment.
     Can work without LinkedIn URL (just name + company).
     Costs: Email = 1 credit, Mobile = 10 credits
+
+    Note: Each request creates a fresh client to avoid global state issues.
     """
 
     def __init__(self):
@@ -37,7 +35,6 @@ class FullEnrichClient:
         self.timeout = settings.api_timeout
         self.max_poll_attempts = 15  # Reduced from 30 - max 30 seconds polling
         self.poll_interval = 2  # seconds
-        self._api_disabled = False  # Track if API is unavailable (e.g., no credits)
 
     async def enrich(
         self,
@@ -54,10 +51,6 @@ class FullEnrichClient:
         """
         if not self.api_key:
             logger.warning("FullEnrich API key not configured")
-            return None
-
-        if self._api_disabled:
-            logger.warning("FullEnrich API disabled (no credits or rate limited)")
             return None
 
         if not company_name and not domain:
@@ -123,10 +116,9 @@ class FullEnrichClient:
                 status_code = e.response.status_code
                 logger.error(f"FullEnrich start error: {status_code} - {e.response.text}")
 
-                # Handle payment/credit issues - disable API for this session
+                # Log payment/credit issues but don't disable globally
                 if status_code in (402, 403, 429):
-                    self._api_disabled = True
-                    logger.error(f"FullEnrich API disabled for this session (status {status_code})")
+                    logger.error(f"FullEnrich API auth/payment error (status {status_code}) - check billing")
 
                 return None
             except Exception as e:
@@ -156,7 +148,7 @@ class FullEnrichClient:
                     elif status in ["CANCELED", "CREDITS_INSUFFICIENT", "RATE_LIMIT", "UNKNOWN"]:
                         logger.warning(f"FullEnrich enrichment {status}")
                         if status == "CREDITS_INSUFFICIENT":
-                            self._api_disabled = True
+                            logger.error("FullEnrich: Credits insufficient - check billing")
                         return None
                     # CREATED, IN_PROGRESS → keep polling
 
@@ -169,8 +161,7 @@ class FullEnrichClient:
 
                     # Immediately stop on payment/auth errors
                     if status_code in (402, 403, 401):
-                        logger.error(f"FullEnrich API error {status_code} - stopping immediately")
-                        self._api_disabled = True
+                        logger.error(f"FullEnrich API error {status_code} - check billing")
                         return None
 
                     # For rate limits, wait longer but eventually give up
@@ -306,12 +297,10 @@ class FullEnrichClient:
 
 
 def get_fullenrich_client() -> FullEnrichClient:
-    """Get singleton FullEnrich client instance.
-
-    This ensures the _api_disabled flag persists across calls,
-    preventing repeated failed API calls when credits are exhausted.
     """
-    global _fullenrich_instance
-    if _fullenrich_instance is None:
-        _fullenrich_instance = FullEnrichClient()
-    return _fullenrich_instance
+    Get a fresh FullEnrich client instance.
+
+    Creates new instance per request to avoid global state issues
+    when handling concurrent requests.
+    """
+    return FullEnrichClient()

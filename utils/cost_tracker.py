@@ -2,9 +2,12 @@
 API Cost Tracking for Lead Enrichment Pipeline.
 
 Tracks estimated costs for all API calls and provides summary logging.
+
+Uses contextvars for thread-safe per-request tracking.
 """
 
 import logging
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 from datetime import datetime
@@ -272,20 +275,20 @@ class CostTracker:
         return f"[Cost: ${summary.total_cost:.4f} | {len(self.calls)} API calls]"
 
 
-# Global tracker for current enrichment run
-_current_tracker: Optional[CostTracker] = None
+# Thread-safe per-request tracker using contextvars
+_current_tracker: ContextVar[Optional[CostTracker]] = ContextVar('cost_tracker', default=None)
 
 
 def start_cost_tracking(company_name: str = "") -> CostTracker:
-    """Start tracking costs for a new enrichment run."""
-    global _current_tracker
-    _current_tracker = CostTracker(company_name)
-    return _current_tracker
+    """Start tracking costs for a new enrichment run (thread-safe)."""
+    tracker = CostTracker(company_name)
+    _current_tracker.set(tracker)
+    return tracker
 
 
 def get_cost_tracker() -> Optional[CostTracker]:
-    """Get the current cost tracker."""
-    return _current_tracker
+    """Get the current cost tracker (thread-safe)."""
+    return _current_tracker.get()
 
 
 def track_llm(call_type: str, tier: str = "haiku", success: bool = True):

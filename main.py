@@ -125,11 +125,11 @@ async def process_enrichment(payload: WebhookPayload):
         logger.info(f"Enrichment completed for {payload.company}: success={result.success}")
 
         if result.phone:
-            logger.info(f"Found phone: {result.phone.number} ({result.phone.source.value})")
+            logger.info(f"Found phone via {result.phone.source.value}")
         if result.decision_maker:
-            logger.info(f"Decision maker: {result.decision_maker.name} - {result.decision_maker.email}")
+            logger.info(f"Decision maker: {result.decision_maker.name}")
         if result.emails:
-            logger.info(f"All emails: {', '.join(result.emails)}")
+            logger.info(f"Found {len(result.emails)} email(s)")
 
         # TODO: Send result to webhook callback or store in DB
 

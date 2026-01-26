@@ -1,4 +1,4 @@
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from typing import Optional, List
 from enum import Enum
 
@@ -17,18 +17,31 @@ class PhoneType(str, Enum):
     UNKNOWN = "unknown"
 
 
+# Input size limits to prevent abuse
+MAX_DESCRIPTION_LENGTH = 50000  # 50KB max for job description
+MAX_FIELD_LENGTH = 1000  # 1KB max for other fields
+
+
 # Webhook Input (from n8n)
 class WebhookPayload(BaseModel):
-    category: Optional[str] = None
-    company: str
-    date_posted: Optional[str] = None
-    description: str
-    id: str
-    location: Optional[str] = None
+    category: Optional[str] = Field(default=None, max_length=MAX_FIELD_LENGTH)
+    company: str = Field(..., max_length=MAX_FIELD_LENGTH)
+    date_posted: Optional[str] = Field(default=None, max_length=100)
+    description: str = Field(..., max_length=MAX_DESCRIPTION_LENGTH)
+    id: str = Field(..., max_length=MAX_FIELD_LENGTH)
+    location: Optional[str] = Field(default=None, max_length=MAX_FIELD_LENGTH)
     seen: Optional[bool] = False
-    source: Optional[str] = None
-    title: str
-    url: Optional[str] = None
+    source: Optional[str] = Field(default=None, max_length=MAX_FIELD_LENGTH)
+    title: str = Field(..., max_length=MAX_FIELD_LENGTH)
+    url: Optional[str] = Field(default=None, max_length=2000)
+
+    @field_validator('description')
+    @classmethod
+    def truncate_description(cls, v: str) -> str:
+        """Truncate description if too long (graceful handling)."""
+        if v and len(v) > MAX_DESCRIPTION_LENGTH:
+            return v[:MAX_DESCRIPTION_LENGTH]
+        return v
 
 
 # LLM Parsing Result

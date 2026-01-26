@@ -24,10 +24,6 @@ APIFY_BASE_URL = "https://api.apify.com/v2"
 # Note: In API calls, use ~ instead of / for actor names
 LINKEDIN_ACTOR_ID = "supreme_coder~linkedin-profile-scraper"
 
-# Singleton instance
-_apify_linkedin_instance = None
-
-
 @dataclass
 class LinkedInExperience:
     """A single work experience entry from LinkedIn."""
@@ -72,13 +68,14 @@ class ApifyLinkedInClient:
 
     Uses the no-cookies actor to scrape LinkedIn profiles
     and verify current employment.
+
+    Note: Each request creates a fresh client to avoid global state issues.
     """
 
     def __init__(self):
         settings = get_settings()
         self.api_key = settings.apify_api_key if hasattr(settings, 'apify_api_key') else ""
         self.timeout = settings.api_timeout
-        self._api_disabled = False
 
     async def verify_employment(
         self,
@@ -101,14 +98,6 @@ class ApifyLinkedInClient:
                 is_currently_employed=True,  # Assume true if can't verify
                 confidence="low",
                 verification_note="Apify API key nicht konfiguriert - keine Verifizierung möglich"
-            )
-
-        if self._api_disabled:
-            logger.warning("Apify API disabled")
-            return EmploymentVerification(
-                is_currently_employed=True,
-                confidence="low",
-                verification_note="Apify API deaktiviert"
             )
 
         # Scrape the LinkedIn profile
@@ -185,8 +174,7 @@ class ApifyLinkedInClient:
                 logger.error(f"Apify start error: {status_code} - {e.response.text}")
 
                 if status_code in (401, 402, 403):
-                    self._api_disabled = True
-                    logger.error("Apify API disabled (auth/payment issue)")
+                    logger.error("Apify API auth/payment error - check billing")
 
                 return None
             except Exception as e:
@@ -429,8 +417,10 @@ class ApifyLinkedInClient:
 
 
 def get_apify_linkedin_client() -> ApifyLinkedInClient:
-    """Get singleton Apify LinkedIn client instance."""
-    global _apify_linkedin_instance
-    if _apify_linkedin_instance is None:
-        _apify_linkedin_instance = ApifyLinkedInClient()
-    return _apify_linkedin_instance
+    """
+    Get a fresh Apify LinkedIn client instance.
+
+    Creates new instance per request to avoid global state issues
+    when handling concurrent requests.
+    """
+    return ApifyLinkedInClient()
