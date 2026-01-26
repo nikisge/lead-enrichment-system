@@ -189,8 +189,8 @@ class CostTracker:
             details.append("email found")
         if not success:
             details.append("no result")
-            # Some APIs don't charge on failure
-            if api_name.lower() in ["bettercontact"]:
+            # These APIs don't charge when no result found
+            if api_name.lower() in ["bettercontact", "fullenrich"]:
                 cost = 0.0
 
         self.calls.append(APICall(
