@@ -335,8 +335,8 @@ async def enrich_lead(
         for vc in validated_candidates[:3]:
             logger.info(f"  - {vc.name} (score: {vc.relevance_score}): {vc.validation_notes}")
 
-    # Take top 3 validated candidates
-    top_candidates = validated_candidates[:3]
+    # Take only top 1 candidate for efficiency (was 3 - too slow)
+    top_candidates = validated_candidates[:1]
 
     # ========== PHASE 5: LINKEDIN SEARCH + EMPLOYMENT VERIFICATION ==========
     #
