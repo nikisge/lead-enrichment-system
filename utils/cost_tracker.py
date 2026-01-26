@@ -293,20 +293,23 @@ def get_cost_tracker() -> Optional[CostTracker]:
 
 def track_llm(call_type: str, tier: str = "haiku", success: bool = True):
     """Convenience function to track LLM call."""
-    if _current_tracker:
-        _current_tracker.track_llm_call(call_type, tier, success)
+    tracker = _current_tracker.get()
+    if tracker:
+        tracker.track_llm_call(call_type, tier, success)
 
 
 def track_openrouter(call_type: str, success: bool = True):
     """Convenience function to track OpenRouter call."""
-    if _current_tracker:
-        _current_tracker.track_openrouter_call(call_type, success)
+    tracker = _current_tracker.get()
+    if tracker:
+        tracker.track_openrouter_call(call_type, success)
 
 
 def track_google(query_type: str = "search"):
     """Convenience function to track Google search."""
-    if _current_tracker:
-        _current_tracker.track_google_search(query_type)
+    tracker = _current_tracker.get()
+    if tracker:
+        tracker.track_google_search(query_type)
 
 
 def track_enrichment(
@@ -316,18 +319,21 @@ def track_enrichment(
     found_email: bool = False
 ):
     """Convenience function to track enrichment API."""
-    if _current_tracker:
-        _current_tracker.track_enrichment_api(api_name, success, found_phone, found_email)
+    tracker = _current_tracker.get()
+    if tracker:
+        tracker.track_enrichment_api(api_name, success, found_phone, found_email)
 
 
 def track_apify(success: bool = True):
     """Convenience function to track Apify call."""
-    if _current_tracker:
-        _current_tracker.track_apify_scrape(success)
+    tracker = _current_tracker.get()
+    if tracker:
+        tracker.track_apify_scrape(success)
 
 
 def log_cost_summary():
     """Log the cost summary for current run."""
-    if _current_tracker:
-        return _current_tracker.log_summary()
+    tracker = _current_tracker.get()
+    if tracker:
+        return tracker.log_summary()
     return None
