@@ -251,65 +251,89 @@ class ApifyLinkedInClient:
         """Parse Apify response into LinkedInProfile."""
         experiences = []
 
+        # CRITICAL: Get current company from Apify's direct fields (most reliable!)
+        # Apify provides these fields directly from LinkedIn's profile header
+        current_company_from_api = (
+            data.get("companyName") or
+            (data.get("currentCompany", {}) or {}).get("name")
+        )
+        current_title_from_api = data.get("jobTitle")
+
+        logger.info(f"Apify direct fields: currentCompany='{current_company_from_api}', jobTitle='{current_title_from_api}'")
+
         # Parse positions from the supreme_coder actor format
         positions = data.get("positions") or data.get("experiences") or []
+        logger.info(f"Parsing {len(positions)} positions from LinkedIn profile")
 
-        for pos in positions:
-            # Get company name from nested company object or direct field
-            company_obj = pos.get("company", {})
-            company = (
-                company_obj.get("name") if isinstance(company_obj, dict) else
-                pos.get("companyName") or
-                pos.get("company") or
-                ""
-            )
+        for idx, pos in enumerate(positions):
+            # Check if this is a GROUPED position (multiple roles at same company)
+            # Grouped positions have a nested "positions" array
+            nested_positions = pos.get("positions")
 
-            title = pos.get("title") or pos.get("position") or ""
+            if nested_positions and isinstance(nested_positions, list):
+                # GROUPED POSITION: Parse each nested sub-position
+                company_obj = pos.get("company", {})
+                company = company_obj.get("name") if isinstance(company_obj, dict) else ""
 
-            # Check time period for current status
-            time_period = pos.get("timePeriod", {})
-            end_date_obj = time_period.get("endDate")
-            start_date_obj = time_period.get("startDate")
+                logger.info(f"  Position {idx}: GROUPED at {company} with {len(nested_positions)} sub-positions")
 
-            # endDate is None for current positions
-            is_current = end_date_obj is None
+                for sub_idx, sub_pos in enumerate(nested_positions):
+                    sub_title = sub_pos.get("title") or ""
+                    is_current, start_date, end_date = self._parse_time_period(
+                        sub_pos.get("timePeriod"),
+                        company,
+                        current_company_from_api
+                    )
+                    logger.info(f"    Sub-position {sub_idx}: {sub_title} | {start_date} - {end_date or 'Present'} | is_current={is_current}")
 
-            # Format dates as strings
-            start_date = None
-            if start_date_obj:
-                year = start_date_obj.get("year", "")
-                month = start_date_obj.get("month", "")
-                start_date = f"{month}/{year}" if month else str(year)
+                    experiences.append(LinkedInExperience(
+                        company_name=company,
+                        title=sub_title,
+                        start_date=start_date,
+                        end_date=end_date,
+                        is_current=is_current,
+                        location=sub_pos.get("locationName") or sub_pos.get("location")
+                    ))
+            else:
+                # SINGLE POSITION: Parse normally
+                company_obj = pos.get("company", {})
+                company = (
+                    company_obj.get("name") if isinstance(company_obj, dict) else
+                    pos.get("companyName") or
+                    pos.get("company") or
+                    ""
+                )
+                title = pos.get("title") or pos.get("position") or ""
 
-            end_date = None
-            if end_date_obj:
-                year = end_date_obj.get("year", "")
-                month = end_date_obj.get("month", "")
-                end_date = f"{month}/{year}" if month else str(year)
+                is_current, start_date, end_date = self._parse_time_period(
+                    pos.get("timePeriod"),
+                    company,
+                    current_company_from_api
+                )
 
-            experiences.append(LinkedInExperience(
-                company_name=company,
-                title=title,
-                start_date=start_date,
-                end_date=end_date,
-                is_current=is_current,
-                location=pos.get("locationName") or pos.get("location")
-            ))
+                # Also check for explicit isCurrent field
+                if pos.get("isCurrent") is True:
+                    is_current = True
 
-        # Use direct fields for current company (faster than iterating)
-        current_company = data.get("companyName")
-        current_title = data.get("jobTitle")
+                logger.info(f"  Position {idx}: {company} | {title} | {start_date} - {end_date or 'Present'} | is_current={is_current}")
 
-        # Fallback to first current position if direct fields missing
-        if not current_company:
-            for exp in experiences:
-                if exp.is_current:
-                    current_company = exp.company_name
-                    current_title = exp.title
-                    break
+                experiences.append(LinkedInExperience(
+                    company_name=company,
+                    title=title,
+                    start_date=start_date,
+                    end_date=end_date,
+                    is_current=is_current,
+                    location=pos.get("locationName") or pos.get("location")
+                ))
+
+        # Use API's direct fields as authoritative source for current company
+        current_company = current_company_from_api
+        current_title = current_title_from_api
 
         # Build full name
         name = data.get("fullName") or f"{data.get('firstName', '')} {data.get('lastName', '')}".strip()
+
+        logger.info(f"Profile parsed: {name} | Current: {current_company} as {current_title}")
 
         return LinkedInProfile(
             name=name,
@@ -321,57 +345,138 @@ class ApifyLinkedInClient:
             profile_url=data.get("inputUrl") or data.get("url") or ""
         )
 
+    def _parse_time_period(
+        self,
+        time_period: Optional[dict],
+        company_name: str,
+        current_company_from_api: Optional[str]
+    ) -> tuple[bool, Optional[str], Optional[str]]:
+        """
+        Parse time period and determine if position is current.
+
+        Returns: (is_current, start_date, end_date)
+        """
+        is_current = False
+        start_date = None
+        end_date = None
+
+        if time_period and isinstance(time_period, dict):
+            start_date_obj = time_period.get("startDate")
+            end_date_obj = time_period.get("endDate")
+
+            # Format start date
+            if start_date_obj and isinstance(start_date_obj, dict):
+                year = start_date_obj.get("year", "")
+                month = start_date_obj.get("month", "")
+                start_date = f"{month}/{year}" if month else str(year) if year else None
+
+            # Format end date
+            if end_date_obj and isinstance(end_date_obj, dict):
+                year = end_date_obj.get("year", "")
+                month = end_date_obj.get("month", "")
+                end_date = f"{month}/{year}" if month else str(year) if year else None
+
+            # Position is CURRENT only if:
+            # 1. Has startDate AND endDate is explicitly None (not just missing)
+            # 2. AND matches the current company from API (double-check!)
+            if start_date_obj is not None and end_date_obj is None:
+                # Additional safety: verify against API's current company
+                if current_company_from_api:
+                    if self._company_names_match(
+                        self._normalize_company_name(company_name.lower()),
+                        self._normalize_company_name(current_company_from_api.lower())
+                    ):
+                        is_current = True
+                    else:
+                        # Has no endDate but doesn't match current company
+                        # This can happen with ongoing freelance/side jobs
+                        logger.warning(f"Position at {company_name} has no endDate but doesn't match currentCompany ({current_company_from_api})")
+                        is_current = False
+                else:
+                    # No API current company to verify against, trust the timePeriod
+                    is_current = True
+
+        return is_current, start_date, end_date
+
     def _verify_against_company(
         self,
         profile: LinkedInProfile,
         expected_company: str
     ) -> EmploymentVerification:
-        """Check if profile shows current employment at expected company."""
-        expected_lower = expected_company.lower().strip()
+        """
+        Check if profile shows current employment at expected company.
 
-        # Remove common suffixes for matching
+        Handles multiple current jobs: If person works at Company A + Company B,
+        and we're looking for Company A, they ARE currently employed there.
+        """
+        expected_lower = expected_company.lower().strip()
         expected_normalized = self._normalize_company_name(expected_lower)
 
-        # Check current experiences
-        for exp in profile.experiences:
-            if not exp.is_current:
-                continue
+        logger.info(f"Verifying employment: {profile.name} at '{expected_company}'")
+        logger.info(f"  Profile's primary company (from API): '{profile.current_company}'")
 
-            company_normalized = self._normalize_company_name(exp.company_name.lower())
+        # Collect ALL current jobs (person might have multiple!)
+        current_jobs = [e for e in profile.experiences if e.is_current]
 
-            # Check for match
-            if self._company_names_match(expected_normalized, company_normalized):
+        # Also add the primary company from API if not already in list
+        if profile.current_company:
+            primary_in_list = any(
+                self._company_names_match(
+                    self._normalize_company_name(e.company_name.lower()),
+                    self._normalize_company_name(profile.current_company.lower())
+                )
+                for e in current_jobs
+            )
+            if not primary_in_list:
+                # Add primary company as a current job
+                current_jobs.insert(0, LinkedInExperience(
+                    company_name=profile.current_company,
+                    title=profile.current_title or "",
+                    is_current=True
+                ))
+
+        logger.info(f"  Total current positions: {len(current_jobs)}")
+        for idx, job in enumerate(current_jobs):
+            logger.info(f"    [{idx}] {job.company_name} | {job.title}")
+
+        # Check if ANY current job matches the expected company
+        for job in current_jobs:
+            job_normalized = self._normalize_company_name(job.company_name.lower())
+            logger.info(f"  Comparing: '{expected_normalized}' vs '{job_normalized}'")
+
+            if self._company_names_match(expected_normalized, job_normalized):
+                logger.info(f"  ✓ MATCH FOUND: {job.company_name}")
                 return EmploymentVerification(
                     is_currently_employed=True,
-                    company_name_matched=exp.company_name,
-                    current_title=exp.title,
+                    company_name_matched=job.company_name,
+                    current_title=job.title,
                     confidence="high",
-                    verification_note=f"Aktuell bei {exp.company_name} als {exp.title}",
+                    verification_note=f"Aktuell bei {job.company_name} als {job.title}",
                     profile=profile
                 )
 
-        # No current match found - check if they have ANY current job
-        current_jobs = [e for e in profile.experiences if e.is_current]
-
+        # No match found in any current job
         if current_jobs:
-            # They work somewhere else
-            other_company = current_jobs[0].company_name
+            other_companies = ", ".join([e.company_name for e in current_jobs[:3]])  # Max 3
+            if len(current_jobs) > 3:
+                other_companies += f" (+{len(current_jobs) - 3} weitere)"
+            logger.warning(f"  ✗ NO MATCH: Person works at [{other_companies}], NOT at '{expected_company}'")
             return EmploymentVerification(
                 is_currently_employed=False,
                 company_name_matched="",
                 current_title=current_jobs[0].title,
                 confidence="high",
-                verification_note=f"Arbeitet aktuell bei {other_company}, NICHT bei {expected_company}",
+                verification_note=f"Arbeitet aktuell bei {other_companies}, NICHT bei {expected_company}",
                 profile=profile
             )
         else:
-            # No current job listed - might be between jobs or profile not updated
+            logger.warning(f"  ✗ NO CURRENT JOB: {profile.name} has no current position listed")
             return EmploymentVerification(
                 is_currently_employed=False,
                 company_name_matched="",
                 current_title="",
                 confidence="medium",
-                verification_note=f"Keine aktuelle Position auf LinkedIn - möglicherweise veraltet",
+                verification_note=f"Keine aktuelle Position auf LinkedIn gefunden",
                 profile=profile
             )
 

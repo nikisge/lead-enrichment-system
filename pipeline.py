@@ -335,22 +335,23 @@ async def enrich_lead(
         for vc in validated_candidates[:3]:
             logger.info(f"  - {vc.name} (score: {vc.relevance_score}): {vc.validation_notes}")
 
-    # Take only top 1 candidate for efficiency (was 3 - too slow)
-    top_candidates = validated_candidates[:1]
+    # Take top 3 candidates for verification (try up to 3 if earlier ones fail)
+    MAX_CANDIDATES_TO_TRY = 3
+    top_candidates = validated_candidates[:MAX_CANDIDATES_TO_TRY]
 
     # ========== PHASE 5: LINKEDIN SEARCH + EMPLOYMENT VERIFICATION ==========
     #
-    # NEW LOGIC:
-    # 1. For ALL candidates: Search LinkedIn URL if not present
-    # 2. For ALL candidates with LinkedIn URL: Verify with Apify
-    #    - Check: Does name match? Is person currently employed there?
-    #    - If YES: Keep LinkedIn URL (verified)
-    #    - If NO: Discard LinkedIn URL (set to None)
-    # 3. After verification:
+    # LOGIC:
+    # 1. Try up to 3 candidates in order of relevance
+    # 2. For each candidate:
+    #    - Search LinkedIn URL if not present
+    #    - Verify with Apify (is person currently employed there?)
+    # 3. Decision:
     #    - Trusted sources (job_url, llm_parse, team_page, impressum):
     #      Keep candidate even WITHOUT LinkedIn (person exists on website)
     #    - Untrusted sources (linkedin_fallback):
-    #      ONLY keep if LinkedIn was verified (no other proof they work there)
+    #      ONLY keep if LinkedIn was verified → otherwise try next candidate!
+    # 4. Stop as soon as we have ONE verified candidate (save API costs)
 
     linkedin_client = LinkedInSearchClient()
     apify_client = get_apify_linkedin_client()
@@ -359,7 +360,13 @@ async def enrich_lead(
 
     verified_candidates: List[CandidateValidation] = []
 
-    for candidate in top_candidates:
+    for candidate_idx, candidate in enumerate(top_candidates):
+        # Stop if we already have a verified candidate
+        if verified_candidates:
+            logger.info(f"Already have verified candidate, skipping remaining {len(top_candidates) - candidate_idx}")
+            break
+
+        logger.info(f"Trying candidate {candidate_idx + 1}/{len(top_candidates)}: {candidate.name}")
         candidate_data = next(
             (c for c in all_candidates if c.get("name", "").lower() == (candidate.name or "").lower()),
             {}
@@ -475,11 +482,15 @@ async def enrich_lead(
                 enrichment_path.append(f"fallback_verified_{_safe_first_name(candidate.name)}")
                 logger.info(f"FALLBACK VERIFIED: {candidate.name} - LinkedIn bestätigt")
             else:
-                # No verified LinkedIn = no proof they work there = skip
+                # No verified LinkedIn = no proof they work there = try next candidate!
                 candidate_data["verified_current"] = False
                 candidate_data["verification_note"] = "LinkedIn-Fallback ohne Verifizierung - übersprungen"
                 enrichment_path.append(f"fallback_skipped_{_safe_first_name(candidate.name)}")
-                logger.warning(f"FALLBACK SKIPPED: {candidate.name} - kein verifiziertes LinkedIn")
+                remaining = len(top_candidates) - candidate_idx - 1
+                if remaining > 0:
+                    logger.warning(f"FALLBACK SKIPPED: {candidate.name} - arbeitet nicht mehr dort, versuche nächsten Kandidat ({remaining} übrig)")
+                else:
+                    logger.warning(f"FALLBACK SKIPPED: {candidate.name} - arbeitet nicht mehr dort, keine weiteren Kandidaten")
 
     # Use verified candidates for phone enrichment
     if verified_candidates:
