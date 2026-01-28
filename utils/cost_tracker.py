@@ -41,7 +41,7 @@ API_COSTS = {
     "kaspr": 0.10,                     # ~€0.10 per credit
 
     # Verification APIs
-    "apify_linkedin": 0.003,           # ~$3/1000 profiles
+    "apify_linkedin": 0.004,           # ~$4/1000 profiles (HarvestAPI)
 }
 
 # Estimated tokens per LLM call type

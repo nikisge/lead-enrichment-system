@@ -1,8 +1,8 @@
 """
 Apify LinkedIn Profile Scraper client for employment verification.
 
-Uses the "supreme_coder/linkedin-profile-scraper" actor (No Cookies required).
-Cost: ~$3 per 1,000 profiles = $0.003 per profile
+Uses the "harvestapi/linkedin-profile-scraper" actor (No Cookies required).
+Cost: ~$4 per 1,000 profiles = $0.004 per profile
 
 Purpose: Verify if a person currently works at a specific company
 by checking their LinkedIn employment history.
@@ -20,16 +20,16 @@ from config import get_settings
 logger = logging.getLogger(__name__)
 
 APIFY_BASE_URL = "https://api.apify.com/v2"
-# Actor: supreme_coder/linkedin-profile-scraper (No cookies needed)
+# Actor: harvestapi/linkedin-profile-scraper (No cookies needed)
 # Note: In API calls, use ~ instead of / for actor names
-LINKEDIN_ACTOR_ID = "supreme_coder~linkedin-profile-scraper"
+LINKEDIN_ACTOR_ID = "harvestapi~linkedin-profile-scraper"
 
 @dataclass
 class LinkedInExperience:
     """A single work experience entry from LinkedIn."""
     company_name: str
     title: str
-    start_date: Optional[str] = None  # e.g., "Jan 2022"
+    start_date: Optional[str] = None  # e.g., "Jan 2024"
     end_date: Optional[str] = None    # None = "Present" = currently employed
     is_current: bool = False
     location: Optional[str] = None
@@ -64,7 +64,7 @@ class EmploymentVerification:
 
 class ApifyLinkedInClient:
     """
-    Apify LinkedIn Profile Scraper client.
+    Apify LinkedIn Profile Scraper client (HarvestAPI).
 
     Uses the no-cookies actor to scrape LinkedIn profiles
     and verify current employment.
@@ -95,27 +95,37 @@ class ApifyLinkedInClient:
         if not self.api_key:
             logger.warning("Apify API key not configured")
             return EmploymentVerification(
-                is_currently_employed=True,  # Assume true if can't verify
-                confidence="low",
+                is_currently_employed=False,  # Can't verify = not verified!
+                confidence="none",
                 verification_note="Apify API key nicht konfiguriert - keine Verifizierung möglich"
             )
 
-        # Scrape the LinkedIn profile
-        profile = await self.scrape_profile(linkedin_url)
+        try:
+            # Scrape the LinkedIn profile
+            profile = await self.scrape_profile(linkedin_url)
 
-        if not profile:
+            if not profile:
+                logger.warning("Could not scrape LinkedIn profile - treating as NOT verified")
+                return EmploymentVerification(
+                    is_currently_employed=False,  # Can't verify = not verified!
+                    confidence="none",
+                    verification_note="LinkedIn Profil konnte nicht gescraped werden - nicht verifiziert"
+                )
+
+            # Check if currently employed at expected company
+            return self._verify_against_company(profile, expected_company)
+
+        except Exception as e:
+            logger.error(f"Employment verification failed unexpectedly: {e}")
             return EmploymentVerification(
-                is_currently_employed=True,  # Assume true if can't scrape
-                confidence="low",
-                verification_note="LinkedIn Profil konnte nicht gescraped werden"
+                is_currently_employed=False,
+                confidence="none",
+                verification_note=f"Verifizierung fehlgeschlagen: {str(e)[:100]}"
             )
-
-        # Check if currently employed at expected company
-        return self._verify_against_company(profile, expected_company)
 
     async def scrape_profile(self, linkedin_url: str) -> Optional[LinkedInProfile]:
         """
-        Scrape a LinkedIn profile using Apify.
+        Scrape a LinkedIn profile using Apify (HarvestAPI actor).
 
         Args:
             linkedin_url: LinkedIn profile URL
@@ -142,7 +152,6 @@ class ApifyLinkedInClient:
     async def _start_actor_run(self, linkedin_url: str) -> Optional[str]:
         """Start an Apify actor run for the given LinkedIn URL."""
         async with httpx.AsyncClient(timeout=self.timeout) as client:
-            # Use the sync run endpoint (waits for completion)
             url = f"{APIFY_BASE_URL}/acts/{LINKEDIN_ACTOR_ID}/runs"
 
             headers = {
@@ -150,9 +159,9 @@ class ApifyLinkedInClient:
                 "Content-Type": "application/json"
             }
 
-            # Actor input - URLs must be objects with 'url' field
+            # HarvestAPI input format: use "queries" field with URLs
             run_input = {
-                "urls": [{"url": linkedin_url}]
+                "queries": [linkedin_url]
             }
 
             try:
@@ -166,15 +175,15 @@ class ApifyLinkedInClient:
                 data = response.json()
 
                 run_id = data.get("data", {}).get("id")
-                logger.info(f"Apify actor started: {run_id}")
+                logger.info(f"Apify HarvestAPI actor started: {run_id}")
                 return run_id
 
             except httpx.HTTPStatusError as e:
                 status_code = e.response.status_code
-                logger.error(f"Apify start error: {status_code} - {e.response.text}")
+                logger.error(f"Apify start error: {status_code} - {e.response.text[:200]}")
 
                 if status_code in (401, 402, 403):
-                    logger.error("Apify API auth/payment error - check billing")
+                    logger.error("Apify API auth/payment error - check billing or API key")
 
                 return None
             except Exception as e:
@@ -240,80 +249,95 @@ class ApifyLinkedInClient:
                     logger.warning("Apify returned empty dataset")
                     return None
 
+                item = items[0]
+
+                # Check for API error response (profile not accessible)
+                if item.get("error") or item.get("status") in (403, 404):
+                    error_details = item.get("error", [])
+                    error_msg = error_details[0].get("error", "Unknown error") if error_details and isinstance(error_details, list) else str(error_details)
+                    logger.warning(f"Apify profile not accessible: {error_msg}")
+                    return None
+
                 # Parse the first profile
-                return self._parse_profile(items[0])
+                return self._parse_profile(item)
 
             except Exception as e:
                 logger.error(f"Apify dataset fetch failed: {e}")
                 return None
 
-    def _parse_profile(self, data: dict) -> LinkedInProfile:
-        """Parse Apify response into LinkedInProfile."""
-        experiences = []
+    def _parse_profile(self, data: dict) -> Optional[LinkedInProfile]:
+        """
+        Parse HarvestAPI response into LinkedInProfile.
 
-        # CRITICAL: Get current company from Apify's direct fields (most reliable!)
-        # Apify provides these fields directly from LinkedIn's profile header
-        current_company_from_api = (
-            data.get("companyName") or
-            (data.get("currentCompany", {}) or {}).get("name")
-        )
-        current_title_from_api = data.get("jobTitle")
+        HarvestAPI format:
+        - firstName, lastName (no fullName)
+        - currentPosition: [{companyName, dateRange: {start, end}}]
+        - experience: [{position, companyName, startDate, endDate, ...}]
+        - headline, location.linkedinText, linkedinUrl
+        """
+        try:
+            experiences = []
 
-        logger.info(f"Apify direct fields: currentCompany='{current_company_from_api}', jobTitle='{current_title_from_api}'")
+            # --- Extract current companies from "currentPosition" (most reliable!) ---
+            current_positions = data.get("currentPosition") or []
+            current_company_names_from_api = []
+            current_company_from_api = None  # Primary (first) company
+            current_title_from_api = None
 
-        # Parse positions from the supreme_coder actor format
-        positions = data.get("positions") or data.get("experiences") or []
-        logger.info(f"Parsing {len(positions)} positions from LinkedIn profile")
+            if current_positions and isinstance(current_positions, list):
+                for cp in current_positions:
+                    cp_name = cp.get("companyName")
+                    if cp_name:
+                        current_company_names_from_api.append(cp_name)
+                if current_company_names_from_api:
+                    current_company_from_api = current_company_names_from_api[0]
 
-        for idx, pos in enumerate(positions):
-            # Check if this is a GROUPED position (multiple roles at same company)
-            # Grouped positions have a nested "positions" array
-            nested_positions = pos.get("positions")
+            # Also try headline as title hint (e.g. "Staff Pharmacist at CVS Health")
+            headline = data.get("headline") or ""
 
-            if nested_positions and isinstance(nested_positions, list):
-                # GROUPED POSITION: Parse each nested sub-position
-                company_obj = pos.get("company", {})
-                company = company_obj.get("name") if isinstance(company_obj, dict) else ""
+            logger.info(f"HarvestAPI direct fields: currentCompanies={current_company_names_from_api}, headline='{headline[:80]}'")
 
-                logger.info(f"  Position {idx}: GROUPED at {company} with {len(nested_positions)} sub-positions")
+            # --- Parse experience array ---
+            experience_list = data.get("experience") or []
+            logger.info(f"Parsing {len(experience_list)} experience entries from LinkedIn profile")
 
-                for sub_idx, sub_pos in enumerate(nested_positions):
-                    sub_title = sub_pos.get("title") or ""
-                    is_current, start_date, end_date = self._parse_time_period(
-                        sub_pos.get("timePeriod"),
-                        company,
-                        current_company_from_api
-                    )
-                    logger.info(f"    Sub-position {sub_idx}: {sub_title} | {start_date} - {end_date or 'Present'} | is_current={is_current}")
+            for idx, exp in enumerate(experience_list):
+                company = exp.get("companyName") or ""
+                # HarvestAPI uses "position" field for job title
+                title = exp.get("position") or exp.get("title") or ""
 
-                    experiences.append(LinkedInExperience(
-                        company_name=company,
-                        title=sub_title,
-                        start_date=start_date,
-                        end_date=end_date,
-                        is_current=is_current,
-                        location=sub_pos.get("locationName") or sub_pos.get("location")
-                    ))
-            else:
-                # SINGLE POSITION: Parse normally
-                company_obj = pos.get("company", {})
-                company = (
-                    company_obj.get("name") if isinstance(company_obj, dict) else
-                    pos.get("companyName") or
-                    pos.get("company") or
-                    ""
-                )
-                title = pos.get("title") or pos.get("position") or ""
+                # Parse dates from HarvestAPI format
+                start_date_obj = exp.get("startDate")  # {month: "Jan", year: 2024, text: "Jan 2024"}
+                end_date_obj = exp.get("endDate")       # {text: "Present"} or {month: "Dec", year: 2023, text: "Dec 2023"}
 
-                is_current, start_date, end_date = self._parse_time_period(
-                    pos.get("timePeriod"),
-                    company,
-                    current_company_from_api
-                )
+                start_date = None
+                end_date = None
+                is_current = False
 
-                # Also check for explicit isCurrent field
-                if pos.get("isCurrent") is True:
+                if start_date_obj and isinstance(start_date_obj, dict):
+                    start_date = start_date_obj.get("text") or self._format_date_obj(start_date_obj)
+
+                if end_date_obj and isinstance(end_date_obj, dict):
+                    end_text = end_date_obj.get("text", "")
+                    if end_text.lower() in ("present", "heute", "current", "jetzt"):
+                        # Currently employed here
+                        is_current = True
+                        end_date = None
+                    else:
+                        end_date = end_text or self._format_date_obj(end_date_obj)
+                elif end_date_obj is None and start_date_obj is not None:
+                    # No endDate at all = likely current position
                     is_current = True
+
+                # Note: We trust endDate="Present" from the experience array as-is.
+                # The currentPosition API field only shows the primary/featured position,
+                # not all current positions. A person can legitimately work at multiple
+                # companies simultaneously (e.g., consultant + full-time, co-chair + founder).
+                # We do NOT override is_current based on currentPosition cross-check.
+
+                # Extract title for current position
+                if is_current and not current_title_from_api:
+                    current_title_from_api = title
 
                 logger.info(f"  Position {idx}: {company} | {title} | {start_date} - {end_date or 'Present'} | is_current={is_current}")
 
@@ -323,80 +347,47 @@ class ApifyLinkedInClient:
                     start_date=start_date,
                     end_date=end_date,
                     is_current=is_current,
-                    location=pos.get("locationName") or pos.get("location")
+                    location=exp.get("location") or ""
                 ))
 
-        # Use API's direct fields as authoritative source for current company
-        current_company = current_company_from_api
-        current_title = current_title_from_api
+            # --- Build profile ---
+            name = f"{data.get('firstName', '')} {data.get('lastName', '')}".strip()
+            if not name:
+                name = data.get("fullName") or "Unknown"
 
-        # Build full name
-        name = data.get("fullName") or f"{data.get('firstName', '')} {data.get('lastName', '')}".strip()
+            # Location from HarvestAPI: location.linkedinText or fallback
+            location_obj = data.get("location")
+            location = None
+            if isinstance(location_obj, dict):
+                location = location_obj.get("linkedinText") or location_obj.get("parsed", {}).get("text")
+            elif isinstance(location_obj, str):
+                location = location_obj
 
-        logger.info(f"Profile parsed: {name} | Current: {current_company} as {current_title}")
+            logger.info(f"Profile parsed: {name} | Current: {current_company_from_api} as {current_title_from_api}")
 
-        return LinkedInProfile(
-            name=name,
-            headline=data.get("headline"),
-            location=data.get("geoLocationName") or data.get("location"),
-            experiences=experiences,
-            current_company=current_company,
-            current_title=current_title,
-            profile_url=data.get("inputUrl") or data.get("url") or ""
-        )
+            return LinkedInProfile(
+                name=name,
+                headline=headline,
+                location=location,
+                experiences=experiences,
+                current_company=current_company_from_api,
+                current_title=current_title_from_api,
+                profile_url=data.get("linkedinUrl") or data.get("url") or ""
+            )
 
-    def _parse_time_period(
-        self,
-        time_period: Optional[dict],
-        company_name: str,
-        current_company_from_api: Optional[str]
-    ) -> tuple[bool, Optional[str], Optional[str]]:
-        """
-        Parse time period and determine if position is current.
+        except Exception as e:
+            logger.error(f"Failed to parse HarvestAPI profile data: {e}")
+            return None
 
-        Returns: (is_current, start_date, end_date)
-        """
-        is_current = False
-        start_date = None
-        end_date = None
-
-        if time_period and isinstance(time_period, dict):
-            start_date_obj = time_period.get("startDate")
-            end_date_obj = time_period.get("endDate")
-
-            # Format start date
-            if start_date_obj and isinstance(start_date_obj, dict):
-                year = start_date_obj.get("year", "")
-                month = start_date_obj.get("month", "")
-                start_date = f"{month}/{year}" if month else str(year) if year else None
-
-            # Format end date
-            if end_date_obj and isinstance(end_date_obj, dict):
-                year = end_date_obj.get("year", "")
-                month = end_date_obj.get("month", "")
-                end_date = f"{month}/{year}" if month else str(year) if year else None
-
-            # Position is CURRENT only if:
-            # 1. Has startDate AND endDate is explicitly None (not just missing)
-            # 2. AND matches the current company from API (double-check!)
-            if start_date_obj is not None and end_date_obj is None:
-                # Additional safety: verify against API's current company
-                if current_company_from_api:
-                    if self._company_names_match(
-                        self._normalize_company_name(company_name.lower()),
-                        self._normalize_company_name(current_company_from_api.lower())
-                    ):
-                        is_current = True
-                    else:
-                        # Has no endDate but doesn't match current company
-                        # This can happen with ongoing freelance/side jobs
-                        logger.warning(f"Position at {company_name} has no endDate but doesn't match currentCompany ({current_company_from_api})")
-                        is_current = False
-                else:
-                    # No API current company to verify against, trust the timePeriod
-                    is_current = True
-
-        return is_current, start_date, end_date
+    def _format_date_obj(self, date_obj: dict) -> Optional[str]:
+        """Format a HarvestAPI date object like {month: "Jan", year: 2024} to string."""
+        month = date_obj.get("month", "")
+        year = date_obj.get("year", "")
+        if month and year:
+            return f"{month} {year}"
+        elif year:
+            return str(year)
+        return None
 
     def _verify_against_company(
         self,
