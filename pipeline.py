@@ -145,8 +145,28 @@ async def enrich_lead(
         location=parsed.location or payload.location
     )
 
-    # Step 2: Validate domain from LLM or find via Google
-    if company_info.domain and parsed.company_name:
+    # ========== DOMAIN DISCOVERY (Priority Order) ==========
+    #
+    # 1. Job URL Domain (MOST RELIABLE - if job is on company website)
+    # 2. LLM extracted domain (from job description text)
+    # 3. Heuristic (FREE - generates domains from company name)
+    # 4. Google CSE (Fallback - uses API quota)
+
+    # Priority 1: Extract domain from Job URL (FREE, MOST RELIABLE)
+    if not company_info.domain and payload.url:
+        url_domain = _extract_domain_from_job_url(payload.url, parsed.company_name)
+        if url_domain:
+            # Validate that this domain actually belongs to the company
+            logger.info(f"Job URL domain found: {url_domain} - validating...")
+            if await _ai_validate_domain(url_domain, parsed.company_name):
+                company_info.domain = url_domain
+                enrichment_path.append("job_url_domain_found")
+                logger.info(f"✓ Using domain from job URL: {url_domain}")
+            else:
+                logger.warning(f"Job URL domain {url_domain} rejected by AI validation")
+
+    # Priority 2: Validate LLM-extracted domain
+    if company_info.domain and parsed.company_name and "job_url_domain_found" not in enrichment_path:
         # LLM found a domain - validate it with AI
         logger.info(f"Validating LLM domain '{company_info.domain}' for '{parsed.company_name}'...")
         is_valid = await _ai_validate_domain(company_info.domain, parsed.company_name)
@@ -156,23 +176,35 @@ async def enrich_lead(
             logger.warning(f"LLM domain '{company_info.domain}' rejected - searching alternatives...")
             enrichment_path.append("llm_domain_rejected")
             company_info.domain = None  # Reset - will search below
-
-    if not company_info.domain and parsed.company_name:
-        logger.info("No valid domain - searching via Google...")
-        found_domain = await _google_find_domain(parsed.company_name, validate_with_ai=True)
-        if found_domain:
-            # Check for subdomain patterns and try main domain too
-            # e.g., professional.dkms.org -> also try dkms.de
-            main_domain = _extract_main_domain(found_domain)
-            if main_domain and main_domain != found_domain:
-                logger.info(f"Found subdomain {found_domain}, also trying main domain {main_domain}")
-                company_info.domain = main_domain  # Prefer main domain
-            else:
-                company_info.domain = found_domain
-            enrichment_path.append("google_domain_found")
         else:
-            logger.warning(f"No valid domain found for '{parsed.company_name}'")
-            enrichment_path.append("no_domain_found")
+            enrichment_path.append("llm_domain_validated")
+
+    # Priority 3 & 4: Heuristic then Google
+    if not company_info.domain and parsed.company_name:
+        # Strategy 3: FREE heuristic-based domain discovery (no API costs!)
+        logger.info("No valid domain - trying FREE heuristic search first...")
+        found_domain = await _heuristic_find_domain(parsed.company_name)
+
+        if found_domain:
+            company_info.domain = found_domain
+            enrichment_path.append("heuristic_domain_found")
+            logger.info(f"✓ Heuristic found domain: {found_domain}")
+        else:
+            # Strategy 4: Google CSE as fallback (uses API quota)
+            logger.info("Heuristic failed - falling back to Google search...")
+            found_domain = await _google_find_domain(parsed.company_name, validate_with_ai=True)
+            if found_domain:
+                # Check for subdomain patterns and try main domain too
+                main_domain = _extract_main_domain(found_domain)
+                if main_domain and main_domain != found_domain:
+                    logger.info(f"Found subdomain {found_domain}, also trying main domain {main_domain}")
+                    company_info.domain = main_domain
+                else:
+                    company_info.domain = found_domain
+                enrichment_path.append("google_domain_found")
+            else:
+                logger.warning(f"No valid domain found for '{parsed.company_name}'")
+                enrichment_path.append("no_domain_found")
 
     # ========== PHASE 2: PARALLEL SCRAPING ==========
 
@@ -1164,6 +1196,204 @@ def _extract_main_domain(domain: str) -> Optional[str]:
     return main_domain
 
 
+# Known job portals - we can't extract company domain from these
+JOB_PORTAL_DOMAINS = {
+    # German
+    'indeed.com', 'indeed.de', 'de.indeed.com',
+    'stepstone.de', 'stepstone.at', 'stepstone.ch',
+    'monster.de', 'monster.at', 'monster.ch',
+    'xing.com', 'linkedin.com',
+    'jobware.de', 'stellenanzeigen.de', 'jobs.de',
+    'karriere.at', 'jobs.ch', 'jobscout24.de',
+    'kimeta.de', 'yourfirm.de', 'glassdoor.de', 'glassdoor.com',
+    'kununu.de', 'meinestadt.de', 'hokify.de', 'hokify.at',
+    'gigajob.de', 'arbeitsagentur.de', 'jobboerse.de',
+    'regio-jobanzeiger.de', 'jobbörse.de', 'jobbörse-stellenangebote.de',
+    'experteer.de', 'adzuna.de', 'neuvoo.de', 'jooble.de',
+    'stellenwerk.de', 'greenjobs.de', 'azubiyo.de',
+    'ausbildung.de', 'praktikum.de', 'campusjäger.de',
+    # International
+    'workday.com', 'greenhouse.io', 'lever.co', 'recruitee.com',
+    'personio.de', 'softgarden.de', 'recruitingapp.com',
+    'icims.com', 'taleo.net', 'successfactors.com',
+    'smartrecruiters.com', 'jobvite.com', 'workable.com',
+}
+
+
+def _extract_domain_from_job_url(job_url: Optional[str], company_name: str) -> Optional[str]:
+    """
+    Extract company domain from job posting URL if it's on the company's website.
+
+    This is the MOST RELIABLE source because:
+    - If a job is posted on groeber.de/karriere, the domain IS groeber.de
+    - No guessing, no API calls needed
+
+    Returns None if URL is from a job portal (Indeed, Stepstone, etc.)
+    """
+    if not job_url:
+        return None
+
+    try:
+        parsed = urlparse(job_url)
+        domain = parsed.netloc.lower().replace('www.', '')
+
+        if not domain:
+            return None
+
+        # Check if it's a job portal
+        if any(portal in domain for portal in JOB_PORTAL_DOMAINS):
+            logger.debug(f"Job URL is from job portal: {domain}")
+            return None
+
+        # Additional check: common job portal patterns
+        if any(pattern in domain for pattern in ['jobs.', 'karriere.', 'career.', 'recruiting.']):
+            # Could be jobs.company.de - extract main domain
+            parts = domain.split('.')
+            if len(parts) >= 2:
+                main = '.'.join(parts[-2:])  # company.de
+                logger.info(f"Extracted main domain from job subdomain: {domain} -> {main}")
+                return main
+
+        logger.info(f"✓ Job URL domain extracted: {domain} (from {job_url[:50]}...)")
+        return domain
+
+    except Exception as e:
+        logger.warning(f"Failed to extract domain from job URL: {e}")
+        return None
+
+
+async def _heuristic_find_domain(company_name: str) -> Optional[str]:
+    """
+    Find company domain using smart heuristics - COMPLETELY FREE!
+
+    Strategy:
+    1. Extract meaningful words from company name
+    2. Generate possible domain variations
+    3. Check if domains exist via HEAD requests (free!)
+    4. Validate with AI
+
+    Example: "Gröber Holzbau GmbH" → tries groeber.de, groeber.com, groeber-holzbau.de, etc.
+    """
+    settings = get_settings()
+
+    # Step 1: Normalize company name and extract words
+    name_lower = company_name.lower().strip()
+
+    # Remove legal suffixes
+    legal_suffixes = [
+        ' gmbh & co. kg', ' gmbh & co kg', ' gmbh & co.kg',
+        ' gmbh', ' ag', ' kg', ' ohg', ' mbh', ' ug', ' e.v.', ' e.v',
+        ' co.', ' & co', ' inc', ' ltd', ' se', ' sa'
+    ]
+    for suffix in legal_suffixes:
+        name_lower = name_lower.replace(suffix, '')
+
+    name_lower = name_lower.strip()
+
+    # Convert umlauts for domain names
+    def to_domain_chars(text: str) -> str:
+        """Convert German umlauts to domain-safe characters."""
+        replacements = [
+            ('ä', 'ae'), ('ö', 'oe'), ('ü', 'ue'), ('ß', 'ss'),
+            ('Ä', 'ae'), ('Ö', 'oe'), ('Ü', 'ue')
+        ]
+        for umlaut, replacement in replacements:
+            text = text.replace(umlaut, replacement)
+        # Remove any remaining non-domain characters
+        text = re.sub(r'[^a-z0-9\-]', '', text)
+        return text
+
+    # Get individual words
+    words = [w.strip() for w in name_lower.split() if len(w.strip()) >= 2]
+    words_normalized = [to_domain_chars(w) for w in words]
+
+    # Primary word (usually company name)
+    if not words_normalized:
+        logger.warning(f"No usable words in company name: {company_name}")
+        return None
+
+    primary = words_normalized[0]
+
+    # Step 2: Generate domain candidates in priority order
+    domain_candidates = []
+
+    # TLDs to try (prioritized for DACH region)
+    tlds = ['.de', '.com', '.at', '.ch', '.eu', '.net', '.org']
+
+    # Pattern 1: Primary word only (most common) - e.g., groeber.de
+    for tld in tlds:
+        domain_candidates.append(f"{primary}{tld}")
+
+    # Pattern 2: All words joined - e.g., groeberholzbau.de
+    if len(words_normalized) > 1:
+        joined = ''.join(words_normalized)
+        for tld in tlds[:3]:  # Only main TLDs
+            domain_candidates.append(f"{joined}{tld}")
+
+    # Pattern 3: Words with hyphen - e.g., groeber-holzbau.de
+    if len(words_normalized) > 1:
+        hyphenated = '-'.join(words_normalized)
+        for tld in tlds[:3]:
+            domain_candidates.append(f"{hyphenated}{tld}")
+
+    # Pattern 4: Reversed hyphen - e.g., holzbau-groeber.de
+    if len(words_normalized) == 2:
+        reversed_hyphen = f"{words_normalized[1]}-{words_normalized[0]}"
+        for tld in tlds[:2]:
+            domain_candidates.append(f"{reversed_hyphen}{tld}")
+
+    # Remove duplicates while preserving order
+    seen = set()
+    unique_candidates = []
+    for d in domain_candidates:
+        if d not in seen:
+            seen.add(d)
+            unique_candidates.append(d)
+
+    logger.info(f"Heuristic domain candidates for '{company_name}': {unique_candidates[:10]}")
+
+    # Step 3: Check which domains exist via HEAD requests (parallel, fast)
+    async def check_domain_exists(domain: str) -> tuple[str, bool]:
+        """Check if domain exists and has a website."""
+        try:
+            async with httpx.AsyncClient(
+                timeout=5.0,
+                follow_redirects=True,
+                verify=False  # Some sites have cert issues
+            ) as client:
+                # Try HTTPS first
+                response = await client.head(f"https://{domain}", follow_redirects=True)
+                if response.status_code < 400:
+                    return (domain, True)
+                # Try HTTP as fallback
+                response = await client.head(f"http://{domain}", follow_redirects=True)
+                return (domain, response.status_code < 400)
+        except Exception:
+            return (domain, False)
+
+    # Check first 15 candidates in parallel
+    tasks = [check_domain_exists(d) for d in unique_candidates[:15]]
+    results = await asyncio.gather(*tasks)
+
+    # Filter to existing domains
+    existing_domains = [domain for domain, exists in results if exists]
+
+    if not existing_domains:
+        logger.info(f"No heuristic domains exist for '{company_name}'")
+        return None
+
+    logger.info(f"Existing domains for '{company_name}': {existing_domains}")
+
+    # Step 4: Validate with AI (check if domain actually belongs to company)
+    for domain in existing_domains:
+        if await _ai_validate_domain(domain, company_name):
+            logger.info(f"✓ Heuristic found valid domain: {domain} for '{company_name}'")
+            return domain
+
+    logger.warning(f"No heuristic domain passed AI validation for '{company_name}'")
+    return None
+
+
 async def _ai_validate_domain(domain: str, company_name: str) -> bool:
     """
     Use AI to check if a domain belongs to the company.
@@ -1182,14 +1412,14 @@ WICHTIG:
 Antworte NUR mit JSON:
 {{"matches": true/false, "reason": "kurze Begründung"}}"""
 
-        response = await llm_client.chat(
-            messages=[{"role": "user", "content": prompt}],
-            model="haiku",  # Fast and cheap for simple validation
+        response = await llm_client.call(
+            prompt=prompt,
+            tier="fast",  # Fast and cheap for simple validation
             max_tokens=100
         )
 
         import json
-        content = response.strip()
+        content = response.content.strip()
         if content.startswith("```"):
             content = content.split("```")[1]
             if content.startswith("json"):
@@ -1208,8 +1438,8 @@ Antworte NUR mit JSON:
         return matches
 
     except Exception as e:
-        logger.warning(f"AI domain validation failed: {e} - assuming domain is valid")
-        return True  # On error, don't block - let it through
+        logger.error(f"AI domain validation failed: {e} - rejecting domain for safety")
+        return False  # On error, reject - better no domain than wrong domain
 
 
 async def _google_find_domain(company_name: str, validate_with_ai: bool = True) -> Optional[str]:
@@ -1228,7 +1458,8 @@ async def _google_find_domain(company_name: str, validate_with_ai: bool = True) 
         return None
 
     async with httpx.AsyncClient(timeout=settings.api_timeout) as client:
-        query = f'"{company_name}" official website'
+        # Better query: just company name, no "official website" which doesn't help for German companies
+        query = f'"{company_name}"'
         url = "https://www.googleapis.com/customsearch/v1"
         params = {
             "key": settings.google_api_key,
@@ -1250,7 +1481,7 @@ async def _google_find_domain(company_name: str, validate_with_ai: bool = True) 
                 'karriere.at', 'jobs.ch', 'jobware.de', 'stellenanzeigen.de'
             }
 
-            # Collect candidate domains (up to 3)
+            # Collect ALL candidate domains first
             candidate_domains = []
             for item in data.get("items", []):
                 link = item.get("link", "")
@@ -1260,12 +1491,59 @@ async def _google_find_domain(company_name: str, validate_with_ai: bool = True) 
                     if not any(skip in domain for skip in skip_domains):
                         if domain not in candidate_domains:
                             candidate_domains.append(domain)
-                            if len(candidate_domains) >= 3:
-                                break
 
             if not candidate_domains:
                 logger.warning(f"No candidate domains found for {company_name}")
                 return None
+
+            # Smart prioritization: domains containing company name parts should come first
+            def domain_relevance_score(domain: str) -> int:
+                """Higher score = more relevant. Domains with company name parts get priority."""
+                import unicodedata
+
+                # Normalize company name: remove GmbH/AG/etc, lowercase, handle umlauts
+                name_lower = company_name.lower()
+                for suffix in [' gmbh', ' ag', ' kg', ' ohg', ' mbh', ' ug', ' e.v.', ' co.', ' & co']:
+                    name_lower = name_lower.replace(suffix, '')
+
+                # Extract meaningful words (at least 3 chars)
+                name_words = [w for w in name_lower.split() if len(w) >= 3]
+
+                # Normalize domain
+                domain_base = domain.split('.')[0].lower()
+
+                # Also create umlaut-converted versions
+                umlaut_map = {'ä': 'ae', 'ö': 'oe', 'ü': 'ue', 'ß': 'ss', 'a': 'ae', 'o': 'oe', 'u': 'ue'}
+
+                score = 0
+                for word in name_words:
+                    # Check direct match
+                    if word in domain_base:
+                        score += 10
+                    # Check with umlaut conversion (ö -> oe, etc)
+                    word_converted = word
+                    for umlaut, replacement in [('ä', 'ae'), ('ö', 'oe'), ('ü', 'ue'), ('ß', 'ss')]:
+                        word_converted = word_converted.replace(umlaut, replacement)
+                    if word_converted != word and word_converted in domain_base:
+                        score += 10
+                    # Check reverse (domain has ae, word has ä)
+                    domain_unconverted = domain_base
+                    for umlaut, replacement in [('ae', 'ä'), ('oe', 'ö'), ('ue', 'ü')]:
+                        domain_unconverted = domain_unconverted.replace(replacement, umlaut)
+                    if word in domain_unconverted:
+                        score += 10
+
+                return score
+
+            # Sort by relevance (highest first), then keep original order as tiebreaker
+            candidate_domains_scored = [(d, domain_relevance_score(d)) for d in candidate_domains]
+            candidate_domains_scored.sort(key=lambda x: -x[1])
+
+            # Log the prioritization for debugging
+            logger.info(f"Domain candidates for '{company_name}': {[(d, s) for d, s in candidate_domains_scored[:5]]}")
+
+            # Take top 5 for AI validation
+            candidate_domains = [d for d, s in candidate_domains_scored[:5]]
 
             # If AI validation enabled, check each candidate
             if validate_with_ai:
