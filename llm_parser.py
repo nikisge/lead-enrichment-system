@@ -1,7 +1,7 @@
 import json
 import re
 import logging
-from typing import Optional, List
+from typing import Optional, List, Tuple
 from anthropic import AsyncAnthropic
 
 from config import get_settings
@@ -9,21 +9,47 @@ from models import WebhookPayload, ParsedJobPosting
 
 logger = logging.getLogger(__name__)
 
+# Track if fallback was used (will be read by pipeline)
+_last_parse_used_fallback = False
+_last_parse_warning = None
+
+def get_last_parse_warnings() -> List[str]:
+    """Get warnings from the last parse operation."""
+    global _last_parse_used_fallback, _last_parse_warning
+    warnings = []
+    if _last_parse_used_fallback:
+        warnings.append("primary_api_key_failed")
+        warnings.append("used_fallback_api_key")
+    if _last_parse_warning:
+        warnings.append(_last_parse_warning)
+    return warnings
+
+def reset_parse_warnings():
+    """Reset warnings for new parse operation."""
+    global _last_parse_used_fallback, _last_parse_warning
+    _last_parse_used_fallback = False
+    _last_parse_warning = None
+
+
 SYSTEM_PROMPT = """Du bist ein Experte für die Analyse von Stellenanzeigen im DACH-Raum.
 Extrahiere strukturierte Informationen aus der Stellenanzeige.
 
-Wichtig:
+WICHTIG für company_domain:
+- Extrahiere die Domain NUR wenn eine WEBSITE explizit im Text erwähnt wird (z.B. "www.firma.de", "firma.de")
+- IGNORIERE Email-Domains komplett! Email-Adressen sind oft von Personalvermittlungen, nicht vom Unternehmen.
+- Beispiel: Bei "Bewerbung an m.jaeger@pletschacher.de" für "Gröber Holzbau GmbH" → company_domain = null (NICHT pletschacher.de!)
+- Setze company_domain auf null wenn du dir nicht 100% sicher bist
+
+Regeln:
 - Suche nach genannten Ansprechpartnern (oft am Ende: "Ihr Ansprechpartner", "Kontakt", "Bewerbung an")
-- Extrahiere E-Mail-Adressen falls vorhanden
+- Extrahiere E-Mail-Adressen falls vorhanden (für Kontakt, NICHT für Domain!)
 - Extrahiere Telefonnummern falls vorhanden (Format: +49, 0049, oder 0xxx)
-- Identifiziere die Firma und versuche die Domain abzuleiten (aus Email oder Website-Erwähnungen)
 - Bestimme relevante Titel für Entscheider (HR, Personal, Geschäftsführung)
-- Wenn eine Website wie www.firma.de erwähnt wird, nutze "firma.de" als Domain
 
 Antworte NUR mit validem JSON im folgenden Format (keine anderen Texte):
 {
     "company_name": "Firmenname",
-    "company_domain": "firma.de oder null",
+    "company_domain": "firma.de (NUR aus Website-Erwähnung, NICHT aus Email!) oder null",
     "contact_name": "Vorname Nachname oder null",
     "contact_email": "email@firma.de oder null",
     "contact_phone": "+49 123 456789 oder null",
@@ -37,17 +63,47 @@ async def parse_job_posting(payload: WebhookPayload) -> ParsedJobPosting:
     """
     Use LLM to extract structured info from job posting.
     Falls back to regex extraction if LLM fails.
+    Uses fallback API key if primary key fails.
     """
+    reset_parse_warnings()
     settings = get_settings()
 
-    # Try LLM parsing first
+    # Try LLM parsing with primary key first, then fallback
+    api_keys = []
     if settings.anthropic_api_key:
-        try:
-            return await _llm_parse(payload, settings.anthropic_api_key)
-        except Exception as e:
-            logger.warning(f"LLM parsing failed, using fallback: {e}")
+        api_keys.append(("primary", settings.anthropic_api_key))
+    if settings.anthropic_api_key_fallback:
+        api_keys.append(("fallback", settings.anthropic_api_key_fallback))
 
-    # Fallback to regex-based extraction
+    for key_type, api_key in api_keys:
+        try:
+            result = await _llm_parse(payload, api_key)
+            if key_type == "fallback":
+                global _last_parse_used_fallback
+                _last_parse_used_fallback = True
+                logger.warning("PRIMARY API KEY FAILED - Used fallback API key successfully")
+            return result
+        except Exception as e:
+            error_msg = str(e)
+            if "credit balance" in error_msg.lower():
+                logger.error(f"API key ({key_type}) has no credits: {e}")
+                if key_type == "primary":
+                    logger.info("Trying fallback API key...")
+                    continue
+            elif "invalid_api_key" in error_msg.lower() or "authentication" in error_msg.lower():
+                logger.error(f"API key ({key_type}) is invalid: {e}")
+                if key_type == "primary":
+                    logger.info("Trying fallback API key...")
+                    continue
+            else:
+                logger.warning(f"LLM parsing failed with {key_type} key: {e}")
+                if key_type == "primary":
+                    continue
+
+    # All API keys failed - use regex fallback
+    logger.warning("All API keys failed, using regex fallback")
+    global _last_parse_warning
+    _last_parse_warning = "llm_parse_failed_used_regex_fallback"
     return _regex_parse(payload)
 
 
@@ -111,12 +167,24 @@ Beschreibung:
     if not data.get("target_titles"):
         data["target_titles"] = _get_default_titles(payload.title)
 
+    # Remove any extra fields not in ParsedJobPosting
+    allowed_fields = {"company_name", "company_domain", "contact_name", "contact_email",
+                      "contact_phone", "target_titles", "department", "location"}
+    data = {k: v for k, v in data.items() if k in allowed_fields}
+
     return ParsedJobPosting(**data)
 
 
 def _regex_parse(payload: WebhookPayload) -> ParsedJobPosting:
-    """Fallback regex-based parsing."""
+    """
+    Fallback regex-based parsing.
+
+    WICHTIG: Dies ist nur der Fallback wenn AI komplett fehlschlägt.
+    Wir setzen domain=None und lassen die Pipeline später via Google Search
+    die richtige Domain finden. Besser keine Domain als eine falsche!
+    """
     description = payload.description
+    company_name = payload.company
 
     # Extract email
     email_pattern = r'[\w\.-]+@[\w\.-]+\.\w+'
@@ -135,27 +203,11 @@ def _regex_parse(payload: WebhookPayload) -> ParsedJobPosting:
                 contact_phone = phone.strip()
                 break
 
-    # Extract domain from email, website mention, or company name
+    # NICHT automatisch Domain extrahieren im Fallback!
+    # Das war der Bug: Email-Domain von Personalvermittlung wurde verwendet.
+    # Besser: Domain = None setzen, Pipeline macht dann Google Search.
     domain = None
-
-    # Try from email first
-    if contact_email:
-        domain = contact_email.split('@')[1]
-
-    # Try from website mentions (www.xyz.de or xyz.de)
-    if not domain:
-        website_pattern = r'(?:www\.)?([a-zA-Z0-9-]+\.(?:de|com|at|ch|eu|io|net|org))'
-        website_match = re.search(website_pattern, description)
-        if website_match:
-            domain = website_match.group(1)
-
-    # Fallback: derive from company name
-    if not domain:
-        company_clean = payload.company.lower()
-        company_clean = re.sub(r'\s*(gmbh|ag|kg|ohg|mbh|ug|se|co\.?|&).*$', '', company_clean, flags=re.IGNORECASE)
-        company_clean = re.sub(r'[^a-z0-9]', '', company_clean)
-        if company_clean:
-            domain = f"{company_clean}.de"
+    logger.warning(f"Regex fallback: Setting domain=None for '{company_name}' - Pipeline will use Google Search")
 
     # Extract contact name (common patterns)
     contact_name = None
@@ -172,7 +224,7 @@ def _regex_parse(payload: WebhookPayload) -> ParsedJobPosting:
 
     return ParsedJobPosting(
         company_name=payload.company,
-        company_domain=domain,
+        company_domain=domain,  # None - let Pipeline find via Google
         contact_name=contact_name,
         contact_email=contact_email,
         contact_phone=contact_phone,

@@ -1,46 +1,93 @@
 """
-Team Page Discovery for Lead Enrichment.
+Team Page Discovery for Lead Enrichment - V2.
 
-Uses Google Search + AI to find team/management pages:
-1. Google search for team-related pages
-2. AI analyzes snippets to find best URLs
-3. Scrapes promising pages
-4. AI extracts contacts
+Smart "2-Klicks" approach to find team pages like a human would:
 
-Fallback: LinkedIn search for decision makers if no team page found.
+1. Direct URL Check - Try common team page URLs (/team, /ueber-uns, etc.)
+2. Sitemap Scan - Parse sitemap.xml for team-related URLs
+3. Homepage Link Scan - Find team/about links on homepage (no AI, just pattern matching)
+4. Improved Scraping - Better Playwright waits for JS-heavy team pages
+
+Goal: Find the same contacts a human would find with "2 clicks" on the company website.
+
+Cost: $0 extra (no AI for URL discovery, only for contact extraction)
+Time: ~25-30 seconds
 """
 
 import logging
 import asyncio
-from typing import Optional, List, Dict, Any
+import re
+from typing import Optional, List, Dict, Tuple
 from dataclasses import dataclass
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urljoin
+import xml.etree.ElementTree as ET
 
 import httpx
 from bs4 import BeautifulSoup
 
 from config import get_settings
-from clients.llm_client import get_llm_client, ModelTier
 from clients.ai_extractor import extract_contacts_from_page, ExtractedContact
-from clients.ai_validator import validate_linkedin_match
-from utils.cost_tracker import track_google, track_llm
 
 logger = logging.getLogger(__name__)
 
-# Maximum page size to scrape (50KB)
-MAX_PAGE_SIZE = 50_000
+# Maximum page size to scrape (100KB for team pages - they can be image-heavy)
+MAX_PAGE_SIZE = 100_000
 
 # Maximum text to extract from page
 MAX_TEXT_EXTRACT = 30_000
 
+# Common team page URL patterns (ordered by priority)
+TEAM_URL_PATTERNS = [
+    "/team",
+    "/unser-team",
+    "/das-team",
+    "/ueber-uns",
+    "/uber-uns",
+    "/about-us",
+    "/about",
+    "/ansprechpartner",
+    "/kontakt",
+    "/contact",
+    "/mitarbeiter",
+    "/menschen",
+    "/people",
+    "/wir",
+    "/management",
+    "/geschaeftsfuehrung",
+    "/geschaeftsleitung",
+    "/fuehrungsteam",
+    "/leadership",
+]
+
+# Keywords to find team links on homepage (German + English)
+TEAM_LINK_KEYWORDS = [
+    "team", "über uns", "ueber uns", "about us", "about",
+    "ansprechpartner", "kontakt", "contact", "mitarbeiter",
+    "menschen", "people", "wir über uns", "das sind wir",
+    "management", "geschäftsführung", "leadership", "unternehmen"
+]
+
+# Team-specific CSS selectors to wait for
+TEAM_PAGE_SELECTORS = [
+    ".team-member", ".team-card", ".employee", ".mitarbeiter",
+    ".person", ".staff", ".member", ".ansprechpartner",
+    "[class*='team']", "[class*='employee']", "[class*='member']",
+    "[class*='person']", "[class*='staff']", "[class*='mitarbeiter']",
+    ".leadership", ".management", ".geschaeftsfuehrung",
+    # Common grid/card patterns
+    ".person-card", ".team-grid", ".people-grid",
+    # WordPress patterns
+    ".wp-block-team", ".elementor-team-member",
+]
+
 
 @dataclass
 class DiscoveredPage:
-    """A page discovered via Google search."""
+    """A page discovered for team contact extraction."""
     url: str
-    title: str
-    snippet: str
+    source: str  # "direct_url", "sitemap", "homepage_link"
     relevance_score: float = 0.0
+    title: str = ""
 
 
 @dataclass
@@ -48,20 +95,34 @@ class TeamDiscoveryResult:
     """Result from team discovery process."""
     contacts: List[ExtractedContact]
     source_urls: List[str]
+    discovery_method: str = ""  # How we found the team page
     fallback_used: bool = False
     success: bool = False
 
 
 class TeamDiscovery:
     """
-    Discovers team/management pages and extracts contacts.
+    Smart team page discovery - finds contacts like a human with "2 clicks".
     """
 
     def __init__(self):
         settings = get_settings()
-        self.google_api_key = settings.google_api_key
-        self.google_cse_id = settings.google_cse_id
         self.timeout = settings.api_timeout
+        self._http_client: Optional[httpx.AsyncClient] = None
+
+    async def _get_client(self) -> httpx.AsyncClient:
+        """Get or create HTTP client."""
+        if self._http_client is None or self._http_client.is_closed:
+            self._http_client = httpx.AsyncClient(
+                timeout=10,  # Quick timeout for URL checks
+                follow_redirects=True,
+                headers={
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    "Accept-Language": "de-DE,de;q=0.9,en;q=0.8",
+                }
+            )
+        return self._http_client
 
     async def discover_and_extract(
         self,
@@ -71,356 +132,474 @@ class TeamDiscovery:
         max_pages: int = 2
     ) -> TeamDiscoveryResult:
         """
-        Full discovery process: Find pages, scrape, extract contacts.
+        Full discovery process: Find team pages smartly, scrape, extract contacts.
+
+        Strategy (in order):
+        1. Direct URL check - Try common /team, /ueber-uns URLs
+        2. Sitemap scan - Parse sitemap.xml for team URLs
+        3. Homepage link scan - Find team links on homepage
+        4. Scrape found pages with improved Playwright
 
         Args:
             company_name: Company name
-            domain: Company domain
+            domain: Company domain (required for website scraping)
             job_category: Job category for relevance
-            max_pages: Maximum pages to scrape
 
         Returns:
             TeamDiscoveryResult with contacts and metadata
         """
-        logger.info(f"Starting team discovery for {company_name}")
+        logger.info(f"━━━ TEAM DISCOVERY START: {company_name} ━━━")
 
-        # Step 1: Find team page URLs via Google
-        discovered_pages = await self._discover_team_pages(company_name, domain)
-
-        if not discovered_pages:
-            logger.info(f"No team pages found for {company_name}, trying fallback")
-            # Fallback: LinkedIn search for decision makers
-            contacts = await self._fallback_linkedin_search(company_name, job_category)
+        if not domain:
+            logger.warning(f"⚠️ No domain provided for {company_name} - cannot discover team pages")
             return TeamDiscoveryResult(
-                contacts=contacts,
+                contacts=[],
                 source_urls=[],
-                fallback_used=True,
-                success=len(contacts) > 0
+                discovery_method="no_domain",
+                success=False
             )
 
-        # Step 2: Scrape top pages
+        base_url = f"https://{domain}"
+        logger.info(f"🌐 Base URL: {base_url}")
+
+        # Step 1: Try direct URL patterns
+        logger.info("📍 Step 1: Checking direct team page URLs...")
+        direct_pages = await self._check_direct_urls(base_url)
+
+        if direct_pages:
+            logger.info(f"✓ Found {len(direct_pages)} direct team page(s)")
+            for page in direct_pages:
+                logger.info(f"  → {page.url} (score: {page.relevance_score})")
+        else:
+            logger.info("✗ No direct team URLs found")
+
+        # Step 2: Check sitemap
+        discovered_pages = list(direct_pages)  # Start with direct URLs
+
+        if len(discovered_pages) < 2:
+            logger.info("📍 Step 2: Scanning sitemap.xml...")
+            sitemap_pages = await self._scan_sitemap(base_url)
+
+            if sitemap_pages:
+                logger.info(f"✓ Found {len(sitemap_pages)} team page(s) in sitemap")
+                for page in sitemap_pages:
+                    logger.info(f"  → {page.url}")
+                discovered_pages.extend(sitemap_pages)
+            else:
+                logger.info("✗ No team pages in sitemap (or no sitemap)")
+
+        # Step 3: Scan homepage for team links
+        if len(discovered_pages) < 2:
+            logger.info("📍 Step 3: Scanning homepage for team links...")
+            homepage_links = await self._scan_homepage_links(base_url)
+
+            if homepage_links:
+                logger.info(f"✓ Found {len(homepage_links)} team link(s) on homepage")
+                for page in homepage_links:
+                    logger.info(f"  → {page.url} ('{page.title}')")
+                discovered_pages.extend(homepage_links)
+            else:
+                logger.info("✗ No team links found on homepage")
+
+        # Deduplicate and sort by relevance
+        discovered_pages = self._deduplicate_pages(discovered_pages)
+        discovered_pages.sort(key=lambda x: x.relevance_score, reverse=True)
+
+        if not discovered_pages:
+            logger.warning(f"❌ No team pages found for {company_name}")
+            return TeamDiscoveryResult(
+                contacts=[],
+                source_urls=[],
+                discovery_method="none_found",
+                success=False
+            )
+
+        logger.info(f"📍 Step 4: Scraping {min(len(discovered_pages), max_pages)} best page(s)...")
+
+        # Step 4: Scrape best pages
         all_contacts = []
         scraped_urls = []
+        discovery_methods = set()
 
         for page in discovered_pages[:max_pages]:
-            logger.info(f"Scraping team page: {page.url}")
-            contacts = await self._scrape_and_extract(page.url, company_name)
+            logger.info(f"🔍 Scraping: {page.url}")
+            contacts = await self._scrape_team_page(page.url, company_name)
 
             if contacts:
                 all_contacts.extend(contacts)
                 scraped_urls.append(page.url)
-                logger.info(f"Found {len(contacts)} contacts from {page.url}")
+                discovery_methods.add(page.source)
+                logger.info(f"  ✓ Extracted {len(contacts)} contact(s)")
+                for c in contacts:
+                    logger.info(f"    → {c.name} ({c.title or 'no title'})")
+            else:
+                logger.info(f"  ✗ No contacts extracted")
 
-        # Deduplicate by name
+        # Deduplicate contacts by name
         unique_contacts = self._deduplicate_contacts(all_contacts)
 
-        # If still no contacts, try fallback
-        if not unique_contacts:
-            logger.info("No contacts extracted, trying LinkedIn fallback")
-            unique_contacts = await self._fallback_linkedin_search(company_name, job_category)
-            return TeamDiscoveryResult(
-                contacts=unique_contacts,
-                source_urls=scraped_urls,
-                fallback_used=True,
-                success=len(unique_contacts) > 0
-            )
+        method_str = "+".join(sorted(discovery_methods)) if discovery_methods else "none"
+
+        logger.info(f"━━━ TEAM DISCOVERY COMPLETE: {len(unique_contacts)} contacts ━━━")
 
         return TeamDiscoveryResult(
             contacts=unique_contacts,
             source_urls=scraped_urls,
+            discovery_method=method_str,
             fallback_used=False,
-            success=True
+            success=len(unique_contacts) > 0
         )
 
-    async def _discover_team_pages(
-        self,
-        company_name: str,
-        domain: Optional[str] = None
-    ) -> List[DiscoveredPage]:
+    async def _check_direct_urls(self, base_url: str) -> List[DiscoveredPage]:
         """
-        Find team/management pages via Google Search.
-
-        Searches:
-        1. "{company}" Team Geschäftsführung site:{domain}
-        2. "{company}" Ansprechpartner Mitarbeiter
-        3. "{company}" über uns Team
+        Check common team page URL patterns with HEAD requests.
+        Fast and free - just checking if URLs exist.
         """
-        if not self.google_api_key or not self.google_cse_id:
-            logger.warning("Google API not configured for team discovery")
-            return []
+        client = await self._get_client()
+        found_pages = []
 
-        # Build search queries
-        queries = []
+        # Check URLs in parallel (fast)
+        async def check_url(pattern: str, priority: int) -> Optional[DiscoveredPage]:
+            url = f"{base_url}{pattern}"
+            try:
+                response = await client.head(url, timeout=5)
+                if response.status_code == 200:
+                    # Calculate relevance score based on pattern priority
+                    score = 1.0 - (priority * 0.05)  # Earlier patterns = higher score
+                    return DiscoveredPage(
+                        url=url,
+                        source="direct_url",
+                        relevance_score=score
+                    )
+            except Exception as e:
+                logger.debug(f"  HEAD {pattern}: failed ({e})")
+            return None
 
-        if domain:
-            # Site-specific search first
-            queries.append(f'"{company_name}" Team OR Geschäftsführung OR Ansprechpartner site:{domain}')
+        # Check all patterns in parallel
+        tasks = [check_url(pattern, i) for i, pattern in enumerate(TEAM_URL_PATTERNS)]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
 
-        # General searches
-        queries.extend([
-            f'"{company_name}" Team Geschäftsführung',
-            f'"{company_name}" Ansprechpartner über uns',
-            f'"{company_name}" Mitarbeiter Kontakt'
-        ])
+        for result in results:
+            if isinstance(result, DiscoveredPage):
+                found_pages.append(result)
 
-        all_results = []
+        return found_pages
 
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
-            for query in queries[:3]:  # Max 3 queries
-                results = await self._google_search(client, query)
-                all_results.extend(results)
-
-                # Stop if we have enough results
-                if len(all_results) >= 10:
-                    break
-
-        if not all_results:
-            return []
-
-        # Use AI to rank and filter results
-        return await self._analyze_search_results(all_results, company_name, domain)
-
-    async def _google_search(
-        self,
-        client: httpx.AsyncClient,
-        query: str,
-        num_results: int = 5
-    ) -> List[Dict[str, str]]:
-        """Execute Google Custom Search."""
-        url = "https://www.googleapis.com/customsearch/v1"
-        params = {
-            "key": self.google_api_key,
-            "cx": self.google_cse_id,
-            "q": query,
-            "num": num_results
-        }
-
-        try:
-            response = await client.get(url, params=params)
-            response.raise_for_status()
-            track_google("team_discovery_search")  # Track Google API call
-            data = response.json()
-
-            results = []
-            for item in data.get("items", []):
-                results.append({
-                    "url": item.get("link", ""),
-                    "title": item.get("title", ""),
-                    "snippet": item.get("snippet", "")
-                })
-
-            return results
-
-        except Exception as e:
-            logger.warning(f"Google search failed: {e}")
-            return []
-
-    async def _analyze_search_results(
-        self,
-        results: List[Dict[str, str]],
-        company_name: str,
-        domain: Optional[str]
-    ) -> List[DiscoveredPage]:
+    async def _scan_sitemap(self, base_url: str) -> List[DiscoveredPage]:
         """
-        Use AI to analyze search results and find best team page URLs.
+        Parse sitemap.xml to find team-related URLs.
+        No AI needed - just XML parsing + keyword matching.
         """
-        if not results:
-            return []
-
-        # Deduplicate by URL
-        seen_urls = set()
-        unique_results = []
-        for r in results:
-            url = r.get("url", "")
-            if url and url not in seen_urls:
-                seen_urls.add(url)
-                unique_results.append(r)
-
-        # Filter out obvious non-team pages
-        filtered = []
-        skip_domains = [
-            'linkedin.com', 'xing.com', 'facebook.com', 'twitter.com',
-            'youtube.com', 'instagram.com', 'kununu.de', 'glassdoor.com',
-            'indeed.com', 'stepstone.de', 'monster.de', 'arbeitsagentur.de'
+        client = await self._get_client()
+        sitemap_urls = [
+            f"{base_url}/sitemap.xml",
+            f"{base_url}/sitemap_index.xml",
+            f"{base_url}/sitemap-index.xml",
         ]
 
-        for r in unique_results:
-            url = r.get("url", "").lower()
-            if not any(skip in url for skip in skip_domains):
-                filtered.append(r)
+        for sitemap_url in sitemap_urls:
+            try:
+                response = await client.get(sitemap_url, timeout=10)
+                if response.status_code != 200:
+                    continue
 
-        if not filtered:
+                # Parse XML
+                try:
+                    root = ET.fromstring(response.text)
+                except ET.ParseError:
+                    logger.debug(f"Failed to parse sitemap: {sitemap_url}")
+                    continue
+
+                # Handle sitemap index (contains other sitemaps)
+                namespaces = {'ns': 'http://www.sitemaps.org/schemas/sitemap/0.9'}
+
+                # Check if this is a sitemap index
+                sitemap_refs = root.findall('.//ns:sitemap/ns:loc', namespaces)
+                if sitemap_refs:
+                    # It's an index - look for sub-sitemaps about pages
+                    for sitemap_ref in sitemap_refs:
+                        sub_url = sitemap_ref.text
+                        if any(kw in sub_url.lower() for kw in ['page', 'post', 'content']):
+                            # Recursively check this sub-sitemap
+                            sub_pages = await self._parse_sitemap_urls(sub_url, client)
+                            if sub_pages:
+                                return sub_pages
+
+                # Parse URLs directly
+                return await self._parse_sitemap_urls(sitemap_url, client, xml_content=response.text)
+
+            except Exception as e:
+                logger.debug(f"Sitemap check failed for {sitemap_url}: {e}")
+
+        return []
+
+    async def _parse_sitemap_urls(
+        self,
+        sitemap_url: str,
+        client: httpx.AsyncClient,
+        xml_content: Optional[str] = None
+    ) -> List[DiscoveredPage]:
+        """Parse a sitemap and find team-related URLs."""
+        try:
+            if xml_content is None:
+                response = await client.get(sitemap_url, timeout=10)
+                if response.status_code != 200:
+                    return []
+                xml_content = response.text
+
+            root = ET.fromstring(xml_content)
+            namespaces = {'ns': 'http://www.sitemaps.org/schemas/sitemap/0.9'}
+
+            pages = []
+            urls = root.findall('.//ns:url/ns:loc', namespaces)
+
+            # Also try without namespace (some sitemaps don't use it)
+            if not urls:
+                urls = root.findall('.//url/loc')
+
+            for url_elem in urls:
+                url = url_elem.text
+                if not url:
+                    continue
+
+                url_lower = url.lower()
+
+                # Check if URL contains team-related keywords
+                team_keywords = [
+                    'team', 'ueber-uns', 'uber-uns', 'about',
+                    'kontakt', 'contact', 'ansprechpartner',
+                    'mitarbeiter', 'menschen', 'people',
+                    'management', 'fuehrung', 'leadership'
+                ]
+
+                for keyword in team_keywords:
+                    if keyword in url_lower:
+                        # Score based on keyword position in list (earlier = more relevant)
+                        score = 0.8 - (team_keywords.index(keyword) * 0.05)
+                        pages.append(DiscoveredPage(
+                            url=url,
+                            source="sitemap",
+                            relevance_score=score
+                        ))
+                        break
+
+            return pages[:5]  # Max 5 from sitemap
+
+        except Exception as e:
+            logger.debug(f"Sitemap parsing failed: {e}")
             return []
 
-        llm = get_llm_client()
+    async def _scan_homepage_links(self, base_url: str) -> List[DiscoveredPage]:
+        """
+        Scan homepage for team/about links.
+        No AI needed - just find <a> tags with team-related text.
+        """
+        client = await self._get_client()
 
-        prompt = f"""Analysiere diese Google-Suchergebnisse für "{company_name}".
-Welche URLs führen am wahrscheinlichsten zu einer Seite mit Team-Mitgliedern oder Ansprechpartnern?
+        try:
+            response = await client.get(base_url, timeout=15)
+            if response.status_code != 200:
+                logger.debug(f"Homepage request failed: {response.status_code}")
+                return []
 
-Suchergebnisse:
-{filtered[:10]}
+            soup = BeautifulSoup(response.text, 'lxml')
 
-Bewerte jede URL:
-- Team/Mitarbeiter/Über-uns Seiten: hoch (0.8-1.0)
-- Kontakt-Seiten: mittel (0.5-0.7)
-- Impressum: niedrig (0.3-0.5)
-- Irrelevante Seiten: sehr niedrig (0.0-0.2)
+            # Find all links
+            found_pages = []
+            seen_urls = set()
 
-{f"Bevorzuge URLs von der Domain: {domain}" if domain else ""}
+            for link in soup.find_all('a', href=True):
+                href = link.get('href', '')
+                text = link.get_text(strip=True).lower()
 
-Antworte als JSON-Array, sortiert nach Relevanz:
-[{{"url": "...", "title": "...", "snippet": "...", "relevance_score": 0.9}}]
+                # Skip empty or javascript links
+                if not href or href.startswith('#') or href.startswith('javascript:'):
+                    continue
 
-Nur die top 3-4 relevantesten zurückgeben."""
+                # Make URL absolute
+                full_url = urljoin(base_url, href)
 
-        result = await llm.call_json(prompt, tier=ModelTier.FAST)
-        track_llm("team_rank", tier="haiku")  # Ranking uses Haiku
+                # Skip external links
+                if not full_url.startswith(base_url):
+                    continue
 
-        if not result or not isinstance(result, list):
-            # Fallback: return filtered results without AI ranking
-            return [
-                DiscoveredPage(
-                    url=r["url"],
-                    title=r["title"],
-                    snippet=r["snippet"],
-                    relevance_score=0.5
-                )
-                for r in filtered[:3]
-            ]
+                # Skip if already seen
+                if full_url in seen_urls:
+                    continue
 
-        # Parse AI results
-        pages = []
-        for item in result:
-            if isinstance(item, dict) and item.get("url"):
-                score = item.get("relevance_score", 0.5)
-                if score >= 0.3:  # Minimum threshold
-                    pages.append(DiscoveredPage(
-                        url=item["url"],
-                        title=item.get("title", ""),
-                        snippet=item.get("snippet", ""),
-                        relevance_score=score
-                    ))
+                # Check if link text or URL contains team keywords
+                url_lower = full_url.lower()
 
-        # Sort by relevance
-        pages.sort(key=lambda x: x.relevance_score, reverse=True)
+                for keyword in TEAM_LINK_KEYWORDS:
+                    if keyword in text or keyword.replace(' ', '-') in url_lower or keyword.replace(' ', '') in url_lower:
+                        seen_urls.add(full_url)
 
-        logger.info(f"Found {len(pages)} relevant team pages")
-        return pages
+                        # Calculate score based on keyword match
+                        score = 0.7 - (TEAM_LINK_KEYWORDS.index(keyword) * 0.03)
 
-    async def _scrape_and_extract(
+                        # Boost if keyword is in link text (more reliable)
+                        if keyword in text:
+                            score += 0.1
+
+                        found_pages.append(DiscoveredPage(
+                            url=full_url,
+                            source="homepage_link",
+                            relevance_score=score,
+                            title=link.get_text(strip=True)[:50]
+                        ))
+                        break
+
+            # Sort by score and return top 5
+            found_pages.sort(key=lambda x: x.relevance_score, reverse=True)
+            return found_pages[:5]
+
+        except Exception as e:
+            logger.debug(f"Homepage scan failed: {e}")
+            return []
+
+    async def _scrape_team_page(
         self,
         url: str,
         company_name: str
     ) -> List[ExtractedContact]:
         """
-        Scrape a URL and extract contacts using AI.
-        Uses Playwright for JS-rendering (most team pages are JS-heavy).
+        Scrape a team page with improved Playwright settings.
+
+        Better than before:
+        - Longer wait times for JS SPAs
+        - Team-specific selector waiting
+        - Full page scroll to trigger lazy loading
+        - Multiple scroll passes
         """
-        html = await self._scrape_with_playwright(url)
-        source = "playwright"
+        html = await self._scrape_with_playwright_v2(url)
 
         if not html:
-            # Fallback to httpx for simple sites
+            logger.warning(f"⚠️ Playwright scrape failed, trying httpx fallback")
             html = await self._scrape_with_httpx(url)
-            source = "httpx"
 
         if not html:
-            logger.warning(f"Failed to scrape {url}")
+            logger.warning(f"❌ All scraping methods failed for {url}")
             return []
-
-        logger.debug(f"Got {len(html)} bytes HTML from {url} via {source}")
 
         # Parse and extract text
         soup = BeautifulSoup(html, "lxml")
 
-        # Log what elements we found before removing
+        # Log raw body size
         body = soup.find('body')
         if body:
-            all_text_before = body.get_text(separator=" ", strip=True)
-            logger.debug(f"Body text before cleanup: {len(all_text_before)} chars")
+            raw_text = body.get_text(separator=" ", strip=True)
+            logger.info(f"📄 Raw body text: {len(raw_text)} chars")
 
         # Remove non-content elements
-        for elem in soup(["script", "style", "nav", "header", "footer", "aside", "noscript"]):
+        for elem in soup(["script", "style", "nav", "noscript", "svg", "iframe"]):
             elem.decompose()
 
-        text = soup.get_text(separator="\n", strip=True)
+        # Try to find team-specific sections first
+        text = ""
+        team_sections = soup.select(', '.join([
+            "[class*='team']", "[class*='mitarbeiter']", "[class*='employee']",
+            "[class*='people']", "[class*='staff']", "[class*='member']",
+            "[id*='team']", "[id*='mitarbeiter']", "[id*='about']",
+            "main", "article", ".content", "#content"
+        ]))
 
-        # If text is very short, the page is likely a JS SPA that didn't render
-        if len(text) < 100:
-            logger.warning(f"Very little text extracted ({len(text)} chars) from {url} - likely JS SPA not fully rendered")
+        if team_sections:
+            section_texts = []
+            for section in team_sections[:5]:  # Max 5 sections
+                section_text = section.get_text(separator="\n", strip=True)
+                if len(section_text) > 50:
+                    section_texts.append(section_text)
+            text = "\n\n".join(section_texts)
+            logger.info(f"📦 Extracted from {len(team_sections)} team section(s): {len(text)} chars")
 
-            # Try to find any useful content in specific containers
-            for selector in ['main', 'article', '.content', '#content', '#app', '#root', '.page']:
-                container = soup.select_one(selector)
-                if container:
-                    container_text = container.get_text(separator="\n", strip=True)
-                    if len(container_text) > len(text):
-                        text = container_text
-                        logger.debug(f"Found more text in {selector}: {len(text)} chars")
+        # Fallback to full body if sections didn't yield much
+        if len(text) < 200:
+            text = soup.get_text(separator="\n", strip=True)
+            logger.info(f"📦 Fallback to full body: {len(text)} chars")
 
         # Truncate if needed
         if len(text) > MAX_TEXT_EXTRACT:
             text = text[:MAX_TEXT_EXTRACT]
-
-        logger.info(f"Extracted {len(text)} chars from {url}")
+            logger.info(f"📦 Truncated to {MAX_TEXT_EXTRACT} chars")
 
         # Skip AI extraction if we have almost no text
-        if len(text) < 50:
-            logger.warning(f"Skipping AI extraction - not enough text ({len(text)} chars)")
+        if len(text) < 100:
+            logger.warning(f"⚠️ Not enough text for extraction ({len(text)} chars)")
             return []
 
         # Use AI to extract contacts
+        logger.info(f"🤖 Running AI contact extraction...")
         return await extract_contacts_from_page(text, company_name, "team")
 
-    async def _scrape_with_playwright(self, url: str) -> Optional[str]:
-        """Scrape URL with Playwright for JS-rendering."""
+    async def _scrape_with_playwright_v2(self, url: str) -> Optional[str]:
+        """
+        Improved Playwright scraping for JS-heavy team pages.
+
+        Improvements over v1:
+        - Wait for team-specific selectors
+        - Longer initial wait (8s instead of 4s)
+        - Full page scroll (top → bottom → top)
+        - Multiple scroll passes for lazy loading
+        """
         try:
             from playwright.async_api import async_playwright
 
+            logger.info(f"🎭 Starting Playwright (improved settings)...")
+
             async with async_playwright() as p:
-                browser = await p.chromium.launch(headless=True)
+                browser = await p.chromium.launch(
+                    headless=True,
+                    args=['--disable-http2', '--disable-blink-features=AutomationControlled']
+                )
                 try:
                     context = await browser.new_context(
-                        viewport={'width': 1280, 'height': 720},
+                        viewport={'width': 1280, 'height': 900},
                         user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
                     )
                     page = await context.new_page()
 
-                    # Navigate and wait for network to be idle (JS finished loading)
+                    # Navigate with longer timeout
+                    logger.info(f"  → Navigating to {url}")
                     try:
-                        await page.goto(url, wait_until='networkidle', timeout=self.timeout * 1000)
+                        await page.goto(url, wait_until='domcontentloaded', timeout=20000)
+                    except Exception as e:
+                        logger.warning(f"  ⚠️ Navigation error: {e}")
+                        return None
+
+                    # Wait for network to settle
+                    logger.info(f"  → Waiting for network idle...")
+                    try:
+                        await page.wait_for_load_state('networkidle', timeout=10000)
                     except Exception:
-                        # Fallback to domcontentloaded if networkidle times out
-                        logger.debug(f"networkidle timeout for {url}, trying domcontentloaded")
-                        await page.goto(url, wait_until='domcontentloaded', timeout=self.timeout * 1000)
+                        logger.debug(f"  → Network idle timeout (continuing)")
 
-                    # Wait for content to appear - try common selectors
-                    content_selectors = ['main', 'article', '.content', '#content', '.main-content', '[role="main"]']
-                    content_found = False
-
-                    for selector in content_selectors:
+                    # Try to wait for team-specific selectors
+                    logger.info(f"  → Looking for team content selectors...")
+                    team_found = False
+                    for selector in TEAM_PAGE_SELECTORS[:10]:  # Check first 10 selectors
                         try:
-                            await page.wait_for_selector(selector, timeout=3000)
-                            content_found = True
-                            logger.debug(f"Found content selector: {selector}")
+                            await page.wait_for_selector(selector, timeout=2000)
+                            logger.info(f"  ✓ Found team selector: {selector}")
+                            team_found = True
                             break
                         except Exception:
                             continue
 
-                    # If no content selector found, wait a bit longer for JS
-                    if not content_found:
-                        logger.debug(f"No content selector found, waiting 4s for JS")
-                        await page.wait_for_timeout(4000)
+                    if not team_found:
+                        # No team selector found - wait longer for JS to render
+                        logger.info(f"  → No team selectors found, waiting 8s for JS...")
+                        await page.wait_for_timeout(8000)
                     else:
-                        # Small additional wait for any lazy-loaded content
-                        await page.wait_for_timeout(1000)
+                        # Team selector found - small additional wait
+                        await page.wait_for_timeout(2000)
 
-                    # Scroll down to trigger lazy loading
-                    await page.evaluate("window.scrollTo(0, document.body.scrollHeight / 2)")
-                    await page.wait_for_timeout(500)
+                    # Full page scroll to trigger lazy loading
+                    logger.info(f"  → Scrolling page to load lazy content...")
+                    await self._full_page_scroll(page)
 
+                    # Get final content
                     html = await page.content()
-                    logger.debug(f"Playwright got {len(html)} bytes from {url}")
+                    logger.info(f"  ✓ Got {len(html)} bytes HTML")
 
                     if len(html) > MAX_PAGE_SIZE:
                         html = html[:MAX_PAGE_SIZE]
@@ -431,128 +610,74 @@ Nur die top 3-4 relevantesten zurückgeben."""
                     await browser.close()
 
         except ImportError:
-            logger.warning("Playwright not installed, falling back to httpx")
+            logger.warning("⚠️ Playwright not installed")
             return None
         except Exception as e:
-            logger.warning(f"Playwright scraping failed for {url}: {e}")
+            logger.warning(f"❌ Playwright error: {e}")
             return None
+
+    async def _full_page_scroll(self, page) -> None:
+        """
+        Scroll page fully to trigger all lazy loading.
+
+        Pattern: Scroll down in steps, wait, then scroll back up.
+        """
+        try:
+            # Get page height
+            height = await page.evaluate("document.body.scrollHeight")
+            viewport_height = 900
+
+            # Scroll down in steps
+            current = 0
+            while current < height:
+                current += viewport_height
+                await page.evaluate(f"window.scrollTo(0, {current})")
+                await page.wait_for_timeout(300)
+
+            # Wait at bottom
+            await page.wait_for_timeout(1000)
+
+            # Scroll back to top
+            await page.evaluate("window.scrollTo(0, 0)")
+            await page.wait_for_timeout(500)
+
+            # Final scroll to middle (where team often is)
+            await page.evaluate(f"window.scrollTo(0, {height // 2})")
+            await page.wait_for_timeout(500)
+
+        except Exception as e:
+            logger.debug(f"Scroll error: {e}")
 
     async def _scrape_with_httpx(self, url: str) -> Optional[str]:
         """Fallback scraping with httpx (no JS rendering)."""
+        client = await self._get_client()
+
         try:
-            async with httpx.AsyncClient(
-                timeout=self.timeout,
-                follow_redirects=True,
-                headers={
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-                }
-            ) as client:
-                async with client.stream("GET", url) as response:
-                    response.raise_for_status()
+            response = await client.get(url, timeout=15)
+            if response.status_code != 200:
+                return None
 
-                    content_length = response.headers.get("content-length")
-                    if content_length and int(content_length) > MAX_PAGE_SIZE * 2:
-                        logger.warning(f"Page too large: {content_length} bytes")
-                        return None
+            content = response.text
+            if len(content) > MAX_PAGE_SIZE:
+                content = content[:MAX_PAGE_SIZE]
 
-                    chunks = []
-                    total = 0
-                    async for chunk in response.aiter_bytes():
-                        total += len(chunk)
-                        if total > MAX_PAGE_SIZE:
-                            break
-                        chunks.append(chunk)
-
-                    return b"".join(chunks).decode("utf-8", errors="ignore")
+            return content
 
         except Exception as e:
-            logger.warning(f"httpx scraping failed for {url}: {e}")
+            logger.debug(f"httpx scrape failed: {e}")
             return None
 
-    async def _fallback_linkedin_search(
-        self,
-        company_name: str,
-        job_category: Optional[str] = None
-    ) -> List[ExtractedContact]:
-        """
-        Fallback: Search LinkedIn for decision makers when no team page found.
-
-        Searches for:
-        - Geschäftsführer
-        - HR Manager / Personalleiter
-        - Department heads based on job category
-        """
-        if not self.google_api_key or not self.google_cse_id:
-            return []
-
-        # Determine positions to search
-        positions = ["Geschäftsführer", "HR Manager", "Personalleiter"]
-
-        if job_category:
-            cat_lower = job_category.lower()
-            if "it" in cat_lower or "software" in cat_lower or "tech" in cat_lower:
-                positions.insert(1, "CTO")
-            elif "sales" in cat_lower or "vertrieb" in cat_lower:
-                positions.insert(1, "Vertriebsleiter")
-            elif "marketing" in cat_lower:
-                positions.insert(1, "Marketing-Leiter")
-
-        contacts = []
-
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
-            for position in positions[:3]:  # Max 3 position searches
-                query = f'"{company_name}" "{position}" site:linkedin.com/in'
-                results = await self._google_search(client, query, num_results=3)
-
-                for result in results:
-                    url = result.get("url", "")
-                    if "linkedin.com/in/" not in url:
-                        continue
-
-                    # Validate with AI
-                    validation = await validate_linkedin_match(
-                        linkedin_snippet=result.get("snippet", ""),
-                        linkedin_title=result.get("title", ""),
-                        person_name="",  # We don't know the name yet
-                        company_name=company_name
-                    )
-
-                    if validation.valid:
-                        # Extract name from LinkedIn title
-                        name = self._extract_name_from_linkedin_title(result.get("title", ""))
-                        if name:
-                            contacts.append(ExtractedContact(
-                                name=name,
-                                title=position,
-                                source="linkedin_fallback"
-                            ))
-
-                # Stop if we have enough
-                if len(contacts) >= 3:
-                    break
-
-        logger.info(f"LinkedIn fallback found {len(contacts)} contacts")
-        return contacts
-
-    def _extract_name_from_linkedin_title(self, title: str) -> Optional[str]:
-        """Extract name from LinkedIn title like 'Max Müller - HR Manager | LinkedIn'."""
-        if not title:
-            return None
-
-        import re
-
-        # Remove " | LinkedIn" suffix
-        title = re.sub(r'\s*\|\s*LinkedIn.*$', '', title, flags=re.IGNORECASE)
-
-        # Split by " - " to separate name from title
-        parts = re.split(r'\s*[-–]\s*', title)
-        if parts:
-            name = parts[0].strip()
-            # Validate: at least 2 words
-            if len(name.split()) >= 2:
-                return name
-
-        return None
+    def _deduplicate_pages(self, pages: List[DiscoveredPage]) -> List[DiscoveredPage]:
+        """Remove duplicate pages by URL."""
+        seen = set()
+        unique = []
+        for page in pages:
+            # Normalize URL
+            url = page.url.rstrip('/')
+            if url not in seen:
+                seen.add(url)
+                unique.append(page)
+        return unique
 
     def _deduplicate_contacts(self, contacts: List[ExtractedContact]) -> List[ExtractedContact]:
         """Remove duplicate contacts by name."""
@@ -560,15 +685,20 @@ Nur die top 3-4 relevantesten zurückgeben."""
         unique = []
 
         for contact in contacts:
-            name_lower = contact.name.lower()
+            name_lower = contact.name.lower().strip()
             if name_lower not in seen_names:
                 seen_names.add(name_lower)
                 unique.append(contact)
 
         return unique
 
+    async def close(self):
+        """Close HTTP client."""
+        if self._http_client and not self._http_client.is_closed:
+            await self._http_client.aclose()
 
-# Convenience function
+
+# Convenience function (maintains backwards compatibility)
 async def discover_team_contacts(
     company_name: str,
     domain: Optional[str] = None,
@@ -577,11 +707,14 @@ async def discover_team_contacts(
     """
     Discover team contacts for a company.
 
-    Convenience function for quick access.
+    Uses the new "2-clicks" smart discovery approach.
     """
     discovery = TeamDiscovery()
-    return await discovery.discover_and_extract(
-        company_name=company_name,
-        domain=domain,
-        job_category=job_category
-    )
+    try:
+        return await discovery.discover_and_extract(
+            company_name=company_name,
+            domain=domain,
+            job_category=job_category
+        )
+    finally:
+        await discovery.close()

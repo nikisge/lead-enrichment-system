@@ -127,6 +127,9 @@ class EnrichmentResult(BaseModel):
     enrichment_path: List[str] = Field(default_factory=list)
     error: Optional[str] = None
 
+    # Warnings for n8n alerts (e.g. "primary_api_key_failed", "used_fallback_api_key")
+    warnings: List[str] = Field(default_factory=list)
+
     # Original input reference
     job_id: str
     job_title: str

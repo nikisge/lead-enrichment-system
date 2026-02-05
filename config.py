@@ -3,8 +3,9 @@ from functools import lru_cache
 
 
 class Settings(BaseSettings):
-    # API Keys
-    anthropic_api_key: str = ""
+    # API Keys - Primary and Fallback
+    anthropic_api_key: str = ""  # Primary key
+    anthropic_api_key_fallback: str = ""  # Fallback key if primary fails
     apollo_api_key: str = ""
     kaspr_api_key: str = ""
     fullenrich_api_key: str = ""

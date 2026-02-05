@@ -319,9 +319,9 @@ class LLMClient:
             # Map OpenRouter model name to Anthropic model name
             anthropic_model = model.replace("anthropic/", "")
             if anthropic_model == "claude-haiku-4.5":
-                anthropic_model = "claude-haiku-4-5-20251101"
+                anthropic_model = "claude-3-5-haiku-20241022"  # Latest Haiku
             elif anthropic_model == "claude-sonnet-4.5":
-                anthropic_model = "claude-sonnet-4-5-20251101"
+                anthropic_model = "claude-sonnet-4-20250514"  # Latest Sonnet
 
             client = AsyncAnthropic(api_key=self.anthropic_key)
 
@@ -390,26 +390,70 @@ class LLMClient:
         except json.JSONDecodeError:
             pass
 
-        # Try to extract JSON object or array
+        # Try to extract JSON object or array using balanced bracket matching
         import re
 
+        # Find the first [ or { and extract balanced JSON
+        def extract_balanced_json(text: str, start_char: str, end_char: str) -> Optional[str]:
+            start_idx = text.find(start_char)
+            if start_idx == -1:
+                return None
+
+            count = 0
+            in_string = False
+            escape = False
+            end_idx = start_idx
+
+            for i, char in enumerate(text[start_idx:], start_idx):
+                if escape:
+                    escape = False
+                    continue
+                if char == '\\':
+                    escape = True
+                    continue
+                if char == '"' and not escape:
+                    in_string = not in_string
+                    continue
+                if in_string:
+                    continue
+
+                if char == start_char:
+                    count += 1
+                elif char == end_char:
+                    count -= 1
+                    if count == 0:
+                        end_idx = i + 1
+                        break
+
+            if count == 0 and end_idx > start_idx:
+                return text[start_idx:end_idx]
+            return None
+
+        # Try array first (more common for contact extraction)
+        json_str = extract_balanced_json(content, '[', ']')
+        if json_str:
+            try:
+                return json.loads(json_str)
+            except json.JSONDecodeError as e:
+                logger.debug(f"Array JSON parse failed: {e}")
+
         # Try object
-        json_match = re.search(r'\{[\s\S]*\}', content)
+        json_str = extract_balanced_json(content, '{', '}')
+        if json_str:
+            try:
+                return json.loads(json_str)
+            except json.JSONDecodeError as e:
+                logger.debug(f"Object JSON parse failed: {e}")
+
+        # Fallback: try simple regex (non-greedy for cleaner extraction)
+        json_match = re.search(r'\[.*?\]', content, re.DOTALL)
         if json_match:
             try:
                 return json.loads(json_match.group())
             except json.JSONDecodeError:
                 pass
 
-        # Try array
-        json_match = re.search(r'\[[\s\S]*\]', content)
-        if json_match:
-            try:
-                return json.loads(json_match.group())
-            except json.JSONDecodeError:
-                pass
-
-        logger.warning(f"Failed to parse JSON from LLM response: {content[:200]}...")
+        logger.warning(f"Failed to parse JSON from LLM response: {content[:300]}...")
         return None
 
     def get_stats(self) -> dict:

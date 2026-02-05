@@ -25,7 +25,7 @@ from models import (
     WebhookPayload, EnrichmentResult, CompanyInfo, CompanyIntel,
     DecisionMaker, PhoneResult, PhoneSource, PhoneType, PhoneStatus
 )
-from llm_parser import parse_job_posting
+from llm_parser import parse_job_posting, get_last_parse_warnings
 from clients.kaspr import get_kaspr_client
 from clients.fullenrich import get_fullenrich_client
 from clients.bettercontact import get_bettercontact_client
@@ -145,10 +145,21 @@ async def enrich_lead(
         location=parsed.location or payload.location
     )
 
-    # Step 2: Find domain if missing
+    # Step 2: Validate domain from LLM or find via Google
+    if company_info.domain and parsed.company_name:
+        # LLM found a domain - validate it with AI
+        logger.info(f"Validating LLM domain '{company_info.domain}' for '{parsed.company_name}'...")
+        is_valid = await _ai_validate_domain(company_info.domain, parsed.company_name)
+
+        if not is_valid:
+            # Domain doesn't match company - search for alternatives
+            logger.warning(f"LLM domain '{company_info.domain}' rejected - searching alternatives...")
+            enrichment_path.append("llm_domain_rejected")
+            company_info.domain = None  # Reset - will search below
+
     if not company_info.domain and parsed.company_name:
-        logger.info("No domain from LLM - searching via Google...")
-        found_domain = await _google_find_domain(parsed.company_name)
+        logger.info("No valid domain - searching via Google...")
+        found_domain = await _google_find_domain(parsed.company_name, validate_with_ai=True)
         if found_domain:
             # Check for subdomain patterns and try main domain too
             # e.g., professional.dkms.org -> also try dkms.de
@@ -159,6 +170,9 @@ async def enrich_lead(
             else:
                 company_info.domain = found_domain
             enrichment_path.append("google_domain_found")
+        else:
+            logger.warning(f"No valid domain found for '{parsed.company_name}'")
+            enrichment_path.append("no_domain_found")
 
     # ========== PHASE 2: PARALLEL SCRAPING ==========
 
@@ -767,6 +781,9 @@ async def enrich_lead(
     else:
         phone_status = PhoneStatus.API_NO_RESULT
 
+    # Collect warnings (e.g., API key fallback used)
+    warnings = get_last_parse_warnings()
+
     result = EnrichmentResult(
         success=success,
         company=company_info,
@@ -776,6 +793,7 @@ async def enrich_lead(
         phone_status=phone_status,
         emails=unique_emails,
         enrichment_path=enrichment_path,
+        warnings=warnings,
         job_id=payload.id,
         job_title=payload.title
     )
@@ -1146,8 +1164,64 @@ def _extract_main_domain(domain: str) -> Optional[str]:
     return main_domain
 
 
-async def _google_find_domain(company_name: str) -> Optional[str]:
-    """Find company domain via Google Custom Search."""
+async def _ai_validate_domain(domain: str, company_name: str) -> bool:
+    """
+    Use AI to check if a domain belongs to the company.
+    Returns True if domain matches, False otherwise.
+    """
+    try:
+        llm_client = get_llm_client()
+
+        prompt = f"""Prüfe ob die Domain "{domain}" zur Firma "{company_name}" gehört.
+
+WICHTIG:
+- Die Domain muss zur EINSTELLENDEN FIRMA gehören
+- NICHT zu einer Personalvermittlung, Recruiting-Agentur oder Jobportal
+- Beispiel: Domain "pletschacher.de" gehört NICHT zu "Gröber Holzbau GmbH"
+
+Antworte NUR mit JSON:
+{{"matches": true/false, "reason": "kurze Begründung"}}"""
+
+        response = await llm_client.chat(
+            messages=[{"role": "user", "content": prompt}],
+            model="haiku",  # Fast and cheap for simple validation
+            max_tokens=100
+        )
+
+        import json
+        content = response.strip()
+        if content.startswith("```"):
+            content = content.split("```")[1]
+            if content.startswith("json"):
+                content = content[4:]
+        content = content.strip()
+
+        result = json.loads(content)
+        matches = result.get("matches", False)
+        reason = result.get("reason", "")
+
+        if matches:
+            logger.info(f"AI validated domain: {domain} -> {company_name} ✓ ({reason})")
+        else:
+            logger.warning(f"AI rejected domain: {domain} -> {company_name} ✗ ({reason})")
+
+        return matches
+
+    except Exception as e:
+        logger.warning(f"AI domain validation failed: {e} - assuming domain is valid")
+        return True  # On error, don't block - let it through
+
+
+async def _google_find_domain(company_name: str, validate_with_ai: bool = True) -> Optional[str]:
+    """
+    Find company domain via Google Custom Search.
+
+    Args:
+        company_name: The company name to search for
+        validate_with_ai: If True, validates each found domain with AI
+
+    Returns up to 3 candidate domains and validates them.
+    """
     settings = get_settings()
 
     if not settings.google_api_key or not settings.google_cse_id:
@@ -1160,7 +1234,7 @@ async def _google_find_domain(company_name: str) -> Optional[str]:
             "key": settings.google_api_key,
             "cx": settings.google_cse_id,
             "q": query,
-            "num": 5
+            "num": 10  # Get more results to have alternatives
         }
 
         try:
@@ -1172,16 +1246,39 @@ async def _google_find_domain(company_name: str) -> Optional[str]:
             skip_domains = {
                 'linkedin.com', 'xing.com', 'facebook.com', 'twitter.com',
                 'instagram.com', 'youtube.com', 'wikipedia.org', 'kununu.de',
-                'glassdoor.com', 'indeed.com', 'stepstone.de', 'monster.de'
+                'glassdoor.com', 'indeed.com', 'stepstone.de', 'monster.de',
+                'karriere.at', 'jobs.ch', 'jobware.de', 'stellenanzeigen.de'
             }
 
+            # Collect candidate domains (up to 3)
+            candidate_domains = []
             for item in data.get("items", []):
                 link = item.get("link", "")
                 if link:
                     parsed = urlparse(link)
                     domain = parsed.netloc.replace("www.", "")
                     if not any(skip in domain for skip in skip_domains):
+                        if domain not in candidate_domains:
+                            candidate_domains.append(domain)
+                            if len(candidate_domains) >= 3:
+                                break
+
+            if not candidate_domains:
+                logger.warning(f"No candidate domains found for {company_name}")
+                return None
+
+            # If AI validation enabled, check each candidate
+            if validate_with_ai:
+                for domain in candidate_domains:
+                    if await _ai_validate_domain(domain, company_name):
                         return domain
+
+                # No domain passed AI validation
+                logger.warning(f"No domain passed AI validation for {company_name} - candidates were: {candidate_domains}")
+                return None
+            else:
+                # No AI validation - return first candidate
+                return candidate_domains[0]
 
         except Exception as e:
             logger.warning(f"Google domain search failed: {e}")
