@@ -98,16 +98,46 @@ def _is_valid_dach_phone(number: str) -> bool:
     return False
 
 
+PIPELINE_TIMEOUT_SECONDS = 110  # Must be under n8n's 120s timeout
+
+
 async def enrich_lead(
     payload: WebhookPayload,
     skip_paid_apis: bool = False
 ) -> EnrichmentResult:
     """
     Main enrichment pipeline - KI-basierter Flow v4.
+    Wrapped with a timeout to ensure we return before n8n times out.
+    """
+    try:
+        return await asyncio.wait_for(
+            _enrich_lead_inner(payload, skip_paid_apis),
+            timeout=PIPELINE_TIMEOUT_SECONDS
+        )
+    except asyncio.TimeoutError:
+        logger.error(f"Pipeline timeout ({PIPELINE_TIMEOUT_SECONDS}s) for {payload.company}")
+        return EnrichmentResult(
+            success=False,
+            company=CompanyInfo(name=payload.company),
+            phone_status=PhoneStatus.API_NO_RESULT,
+            emails=[],
+            enrichment_path=["pipeline_timeout"],
+            warnings=[f"Pipeline timeout nach {PIPELINE_TIMEOUT_SECONDS}s"],
+            job_id=payload.id,
+            job_title=payload.title
+        )
+
+
+async def _enrich_lead_inner(
+    payload: WebhookPayload,
+    skip_paid_apis: bool = False
+) -> EnrichmentResult:
+    """
+    Inner pipeline logic.
 
     Flow:
-    1.  LLM Parse → Extract contact name, company, email from job posting
-    2.  Google Domain Search → If no domain, find via Google (FREE)
+    1.  LLM Parse -> Extract contact name, company, email from job posting
+    2.  Google Domain Search -> If no domain, find via Google (FREE)
     3.  PARALLEL SCRAPING:
         - Job URL scraping with AI extraction
         - Impressum scraping with AI extraction
@@ -1279,11 +1309,13 @@ async def _heuristic_find_domain(company_name: str) -> Optional[str]:
     # Step 1: Normalize company name and extract words
     name_lower = company_name.lower().strip()
 
-    # Remove legal suffixes
+    # Remove legal suffixes (longest first to avoid partial matches)
     legal_suffixes = [
-        ' gmbh & co. kg', ' gmbh & co kg', ' gmbh & co.kg',
-        ' gmbh', ' ag', ' kg', ' ohg', ' mbh', ' ug', ' e.v.', ' e.v',
-        ' co.', ' & co', ' inc', ' ltd', ' se', ' sa'
+        ' gmbh & co. kgaa', ' gmbh & co. kg', ' gmbh & co kg', ' gmbh & co.kg',
+        ' gmbh & co. ohg', ' partg mbb', ' partg',
+        ' gmbh', ' ggmbh', ' ag', ' kgaa', ' kg', ' ohg', ' mbh',
+        ' ug (haftungsbeschränkt)', ' ug', ' gbr', ' eg', ' e.v.', ' e.v',
+        ' co.', ' & co', ' inc', ' ltd', ' se', ' sa',
     ]
     for suffix in legal_suffixes:
         name_lower = name_lower.replace(suffix, '')
@@ -1317,8 +1349,9 @@ async def _heuristic_find_domain(company_name: str) -> Optional[str]:
     # Step 2: Generate domain candidates in priority order
     domain_candidates = []
 
-    # TLDs to try (prioritized for DACH region)
-    tlds = ['.de', '.com', '.at', '.ch', '.eu', '.net', '.org']
+    # TLDs to try (prioritized for DACH region + modern TLDs)
+    tlds = ['.de', '.com', '.at', '.ch', '.io', '.eu', '.net', '.org',
+            '.tech', '.digital', '.app', '.dev', '.gmbh', '.online']
 
     # Pattern 1: Primary word only (most common) - e.g., groeber.de
     for tld in tlds:
@@ -1327,19 +1360,19 @@ async def _heuristic_find_domain(company_name: str) -> Optional[str]:
     # Pattern 2: All words joined - e.g., groeberholzbau.de
     if len(words_normalized) > 1:
         joined = ''.join(words_normalized)
-        for tld in tlds[:3]:  # Only main TLDs
+        for tld in tlds[:5]:  # Main TLDs including .io
             domain_candidates.append(f"{joined}{tld}")
 
     # Pattern 3: Words with hyphen - e.g., groeber-holzbau.de
     if len(words_normalized) > 1:
         hyphenated = '-'.join(words_normalized)
-        for tld in tlds[:3]:
+        for tld in tlds[:5]:
             domain_candidates.append(f"{hyphenated}{tld}")
 
     # Pattern 4: Reversed hyphen - e.g., holzbau-groeber.de
     if len(words_normalized) == 2:
         reversed_hyphen = f"{words_normalized[1]}-{words_normalized[0]}"
-        for tld in tlds[:2]:
+        for tld in tlds[:3]:
             domain_candidates.append(f"{reversed_hyphen}{tld}")
 
     # Remove duplicates while preserving order
@@ -1352,41 +1385,53 @@ async def _heuristic_find_domain(company_name: str) -> Optional[str]:
 
     logger.info(f"Heuristic domain candidates for '{company_name}': {unique_candidates[:10]}")
 
-    # Step 3: Check which domains exist via HEAD requests (parallel, fast)
-    async def check_domain_exists(domain: str) -> tuple[str, bool]:
-        """Check if domain exists and has a website."""
+    # Step 3: Check which domains exist AND fetch content to detect parked domains
+    async def check_domain_exists(domain: str) -> tuple[str, bool, str]:
+        """Check if domain exists, has a website, and is NOT a parked domain.
+        Returns (domain, exists, page_snippet) - snippet is first ~5000 chars of HTML."""
         try:
             async with httpx.AsyncClient(
-                timeout=5.0,
+                timeout=7.0,
                 follow_redirects=True,
-                verify=False  # Some sites have cert issues
+                verify=False,  # Some sites have cert issues
+                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
             ) as client:
-                # Try HTTPS first
-                response = await client.head(f"https://{domain}", follow_redirects=True)
-                if response.status_code < 400:
-                    return (domain, True)
-                # Try HTTP as fallback
-                response = await client.head(f"http://{domain}", follow_redirects=True)
-                return (domain, response.status_code < 400)
+                # Use GET instead of HEAD to get page content for parking detection
+                for scheme in ["https", "http"]:
+                    try:
+                        response = await client.get(
+                            f"{scheme}://{domain}",
+                            follow_redirects=True,
+                            headers={"Accept": "text/html"}
+                        )
+                        if response.status_code < 400:
+                            content = response.text[:5000] if response.text else ""
+                            if _is_parked_domain(content, domain):
+                                logger.info(f"Parked domain detected: {domain} - skipping")
+                                return (domain, False, "")
+                            return (domain, True, content[:3000])
+                    except Exception:
+                        continue
+                return (domain, False, "")
         except Exception:
-            return (domain, False)
+            return (domain, False, "")
 
     # Check first 15 candidates in parallel
     tasks = [check_domain_exists(d) for d in unique_candidates[:15]]
     results = await asyncio.gather(*tasks)
 
-    # Filter to existing domains
-    existing_domains = [domain for domain, exists in results if exists]
+    # Filter to existing, non-parked domains (keep content snippets for AI validation)
+    existing_domains = [(domain, snippet) for domain, exists, snippet in results if exists]
 
     if not existing_domains:
         logger.info(f"No heuristic domains exist for '{company_name}'")
         return None
 
-    logger.info(f"Existing domains for '{company_name}': {existing_domains}")
+    logger.info(f"Existing domains for '{company_name}': {[d for d, _ in existing_domains]}")
 
-    # Step 4: Validate with AI (check if domain actually belongs to company)
-    for domain in existing_domains:
-        if await _ai_validate_domain(domain, company_name):
+    # Step 4: Validate with AI (now with page content for smarter validation)
+    for domain, snippet in existing_domains:
+        if await _ai_validate_domain(domain, company_name, page_content=snippet):
             logger.info(f"✓ Heuristic found valid domain: {domain} for '{company_name}'")
             return domain
 
@@ -1394,20 +1439,115 @@ async def _heuristic_find_domain(company_name: str) -> Optional[str]:
     return None
 
 
-async def _ai_validate_domain(domain: str, company_name: str) -> bool:
+def _is_parked_domain(html_content: str, domain: str = "") -> bool:
+    """
+    Detect if a domain is parked/for-sale based on page content.
+    Uses simple string matching - completely FREE, no API calls.
+    """
+    if not html_content or len(html_content.strip()) < 50:
+        return True  # Empty or near-empty page = likely parked
+
+    content_lower = html_content.lower()
+
+    # Known parking/domain-sale services
+    parking_services = [
+        'sedo.com', 'sedo.de', 'sedoparking',
+        'godaddy.com', 'godaddy parking',
+        'afternic.com', 'afternic',
+        'hugedomains.com', 'hugedomains',
+        'dan.com',  # Domain marketplace
+        'undeveloped.com',
+        'domainmarket.com',
+        'porkbun.com/domain',
+        'namecheap.com/domains',
+        'ionos.de', 'ionos.com',
+        'united-domains.de',
+        'strato.de/domains',
+        'checkdomain.de',
+        'domainssaubillig',
+        'parkingcrew',
+        'bodis.com',  # Parking service
+        'domainparking',
+        'above.com',
+    ]
+
+    for service in parking_services:
+        if service in content_lower:
+            return True
+
+    # Common parking/for-sale phrases (German + English)
+    parking_phrases = [
+        'diese domain kaufen',
+        'domain kaufen',
+        'domain zu verkaufen',
+        'domain steht zum verkauf',
+        'diese domain ist zu verkaufen',
+        'diese webseite ist zu verkaufen',
+        'domain is for sale',
+        'this domain is for sale',
+        'buy this domain',
+        'domain for sale',
+        'website for sale',
+        'is for sale',
+        'domain name for sale',
+        'this page is parked',
+        'domain parked',
+        'parked domain',
+        'parked by',
+        'domain erwerben',
+        'domain sichern',
+        'sponsored listings',
+        'related searches',  # Typical parking page content
+        'click here to buy',
+        'make an offer',
+        'inquire about this domain',
+        'domain anfragen',
+    ]
+
+    match_count = 0
+    for phrase in parking_phrases:
+        if phrase in content_lower:
+            match_count += 1
+            if match_count >= 1:  # Even one strong indicator is enough
+                return True
+
+    # Check for very thin content (parked pages have almost no real text)
+    # Strip HTML tags for content length check
+    import re as _re
+    text_only = _re.sub(r'<[^>]+>', ' ', html_content)
+    text_only = _re.sub(r'\s+', ' ', text_only).strip()
+    if len(text_only) < 100:
+        return True
+
+    return False
+
+
+async def _ai_validate_domain(domain: str, company_name: str, page_content: str = "") -> bool:
     """
     Use AI to check if a domain belongs to the company.
+    Now optionally includes page content snippet for smarter validation.
     Returns True if domain matches, False otherwise.
     """
     try:
         llm_client = get_llm_client()
 
-        prompt = f"""Prüfe ob die Domain "{domain}" zur Firma "{company_name}" gehört.
+        # Build context from page content if available
+        content_context = ""
+        if page_content:
+            # Strip HTML tags for a cleaner snippet
+            import re as _re
+            text_snippet = _re.sub(r'<[^>]+>', ' ', page_content[:2000])
+            text_snippet = _re.sub(r'\s+', ' ', text_snippet).strip()[:500]
+            if text_snippet:
+                content_context = f'\nInhalt der Webseite (Ausschnitt): "{text_snippet}"'
 
+        prompt = f"""Prüfe ob die Domain "{domain}" zur Firma "{company_name}" gehört.
+{content_context}
 WICHTIG:
 - Die Domain muss zur EINSTELLENDEN FIRMA gehören
 - NICHT zu einer Personalvermittlung, Recruiting-Agentur oder Jobportal
-- Beispiel: Domain "pletschacher.de" gehört NICHT zu "Gröber Holzbau GmbH"
+- Wenn der Webseiteninhalt vorhanden ist, prüfe ob er zur Firma passt
+- Eine Domain-Kauf-Seite oder leere Seite = KEIN Match
 
 Antworte NUR mit JSON:
 {{"matches": true/false, "reason": "kurze Begründung"}}"""
@@ -1503,7 +1643,9 @@ async def _google_find_domain(company_name: str, validate_with_ai: bool = True) 
 
                 # Normalize company name: remove GmbH/AG/etc, lowercase, handle umlauts
                 name_lower = company_name.lower()
-                for suffix in [' gmbh', ' ag', ' kg', ' ohg', ' mbh', ' ug', ' e.v.', ' co.', ' & co']:
+                for suffix in [' gmbh & co. kgaa', ' gmbh & co. kg', ' gmbh & co kg',
+                              ' partg mbb', ' partg', ' gmbh', ' ggmbh', ' ag', ' kgaa',
+                              ' kg', ' ohg', ' mbh', ' ug', ' gbr', ' eg', ' e.v.', ' co.', ' & co']:
                     name_lower = name_lower.replace(suffix, '')
 
                 # Extract meaningful words (at least 3 chars)
