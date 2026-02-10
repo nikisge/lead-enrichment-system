@@ -99,8 +99,6 @@ class LLMClient:
         self.api_key = settings.openrouter_api_key
         self.anthropic_key = settings.anthropic_api_key  # Fallback
         self.timeout = settings.api_timeout
-        self._total_cost = 0.0
-        self._call_count = 0
 
     async def call(
         self,
@@ -164,11 +162,6 @@ class LLMClient:
                 success=False,
                 error="No API key configured (OPENROUTER_API_KEY or ANTHROPIC_API_KEY)"
             )
-
-        # Track costs
-        if response.success:
-            self._total_cost += response.cost_estimate
-            self._call_count += 1
 
         return response
 
@@ -455,19 +448,6 @@ class LLMClient:
 
         logger.warning(f"Failed to parse JSON from LLM response: {content[:300]}...")
         return None
-
-    def get_stats(self) -> dict:
-        """Get usage statistics."""
-        return {
-            "total_calls": self._call_count,
-            "total_cost": round(self._total_cost, 4),
-            "average_cost_per_call": round(self._total_cost / max(1, self._call_count), 4)
-        }
-
-    def reset_stats(self):
-        """Reset usage statistics."""
-        self._total_cost = 0.0
-        self._call_count = 0
 
 
 # Convenience function for quick access

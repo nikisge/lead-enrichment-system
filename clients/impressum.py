@@ -18,6 +18,7 @@ class ImpressumResult:
     emails: List[str]
     website_url: Optional[str] = None  # The actual URL we found
     address: Optional[str] = None  # Street address if found
+    raw_text: Optional[str] = None  # Raw page text for AI extraction
     success: bool = False
 
 
@@ -436,6 +437,7 @@ class ImpressumScraper:
                     emails=emails,
                     website_url=website_url,
                     address=address,
+                    raw_text=text[:10000],  # Keep raw text for AI extraction
                     success=len(phones) > 0 or len(emails) > 0 or address is not None
                 )
 
@@ -537,9 +539,9 @@ class ImpressumScraper:
             # Assume German number without prefix, add +49
             cleaned = '+49' + cleaned
 
-        # FIX: Remove duplicate country codes (+4949, +4943, +4941)
+        # FIX: Remove duplicate country code (+4949 -> +49)
         # This happens when source has formats like "+49 (0)49 89..." or "0049 49 89..."
-        cleaned = re.sub(r'^\+49(49|43|41)', r'+\1', cleaned)
+        cleaned = re.sub(r'^\+4949', '+49', cleaned)
 
         return cleaned
 

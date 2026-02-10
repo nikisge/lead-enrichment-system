@@ -494,17 +494,17 @@ class ApifyLinkedInClient:
         if expected == actual:
             return True
 
-        # One contains the other
-        if expected in actual or actual in expected:
+        # Substring match only for names with 4+ characters (avoid "AB" in "ABCDEF")
+        if len(expected) >= 4 and expected in actual:
+            return True
+        if len(actual) >= 4 and actual in expected:
             return True
 
-        # Check word overlap
-        expected_words = set(expected.split())
-        actual_words = set(actual.split())
+        # Check word overlap (filter out short words ≤2 chars like "IT", "AB")
+        expected_words = {w for w in expected.split() if len(w) > 2}
+        actual_words = {w for w in actual.split() if len(w) > 2}
 
-        # If main word matches (usually first word)
         if expected_words and actual_words:
-            # Check if significant words overlap
             common = expected_words & actual_words
             if len(common) >= 1 and len(common) >= len(expected_words) * 0.5:
                 return True

@@ -1,6 +1,8 @@
 import json
 import re
 import logging
+from contextvars import ContextVar
+from dataclasses import dataclass, field
 from typing import Optional, List, Tuple
 from anthropic import AsyncAnthropic
 
@@ -9,26 +11,41 @@ from models import WebhookPayload, ParsedJobPosting
 
 logger = logging.getLogger(__name__)
 
-# Track if fallback was used (will be read by pipeline)
-_last_parse_used_fallback = False
-_last_parse_warning = None
+
+@dataclass
+class _ParseState:
+    """Per-request parse state (thread/task-safe via ContextVar)."""
+    used_fallback: bool = False
+    warning: Optional[str] = None
+
+
+_parse_state: ContextVar[_ParseState] = ContextVar('_parse_state')
+
+
+def _get_parse_state() -> _ParseState:
+    """Get or create per-context parse state (lazy init avoids shared mutable default)."""
+    try:
+        return _parse_state.get()
+    except LookupError:
+        state = _ParseState()
+        _parse_state.set(state)
+        return state
+
 
 def get_last_parse_warnings() -> List[str]:
     """Get warnings from the last parse operation."""
-    global _last_parse_used_fallback, _last_parse_warning
+    state = _get_parse_state()
     warnings = []
-    if _last_parse_used_fallback:
+    if state.used_fallback:
         warnings.append("primary_api_key_failed")
         warnings.append("used_fallback_api_key")
-    if _last_parse_warning:
-        warnings.append(_last_parse_warning)
+    if state.warning:
+        warnings.append(state.warning)
     return warnings
 
 def reset_parse_warnings():
     """Reset warnings for new parse operation."""
-    global _last_parse_used_fallback, _last_parse_warning
-    _last_parse_used_fallback = False
-    _last_parse_warning = None
+    _parse_state.set(_ParseState())
 
 
 SYSTEM_PROMPT = """Du bist ein Experte für die Analyse von Stellenanzeigen im DACH-Raum.
@@ -79,8 +96,7 @@ async def parse_job_posting(payload: WebhookPayload) -> ParsedJobPosting:
         try:
             result = await _llm_parse(payload, api_key)
             if key_type == "fallback":
-                global _last_parse_used_fallback
-                _last_parse_used_fallback = True
+                _get_parse_state().used_fallback = True
                 logger.warning("PRIMARY API KEY FAILED - Used fallback API key successfully")
             return result
         except Exception as e:
@@ -102,8 +118,7 @@ async def parse_job_posting(payload: WebhookPayload) -> ParsedJobPosting:
 
     # All API keys failed - use regex fallback
     logger.warning("All API keys failed, using regex fallback")
-    global _last_parse_warning
-    _last_parse_warning = "llm_parse_failed_used_regex_fallback"
+    _get_parse_state().warning = "llm_parse_failed_used_regex_fallback"
     return _regex_parse(payload)
 
 
