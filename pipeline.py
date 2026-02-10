@@ -490,7 +490,7 @@ async def _enrich_lead_inner(
     #      ONLY keep if LinkedIn was verified → otherwise try next candidate!
     # 4. Collect up to 2 verified candidates for phone enrichment attempts
     #    (BetterContact/FullEnrich are free on no-result, so 2nd try costs nothing extra)
-    MAX_VERIFIED_CANDIDATES = 2
+    MAX_VERIFIED_CANDIDATES = 1
 
     TRUSTED_SOURCES = {"job_url", "llm_parse", "team_page", "impressum"}
 
