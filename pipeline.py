@@ -119,7 +119,7 @@ def _is_valid_dach_phone(number: str) -> bool:
     return False
 
 
-PIPELINE_TIMEOUT_SECONDS = 110  # Must be under n8n's 120s timeout
+PIPELINE_TIMEOUT_SECONDS = 300  # Waterfall enrichment needs 3+ min per service
 
 
 async def enrich_lead(

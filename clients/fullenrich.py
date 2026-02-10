@@ -33,7 +33,7 @@ class FullEnrichClient:
         settings = get_settings()
         self.api_key = settings.fullenrich_api_key
         self.timeout = settings.api_timeout
-        self.max_poll_attempts = 24  # Max 120 seconds polling (2 min)
+        self.max_poll_attempts = 36  # Max 180 seconds polling (3 min)
         self.poll_interval = 5  # seconds
 
     async def enrich(
