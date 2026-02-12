@@ -5,7 +5,10 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 from config import get_settings
 from models import WebhookPayload, EnrichmentResult
 from pipeline import enrich_lead, enrich_lead_test_mode
-from utils.stats import get_stats, get_stats_summary, reset_stats
+from utils.stats import (
+    get_stats, get_stats_summary, reset_stats,
+    get_pipeline_stats, get_pipeline_dashboard, reset_pipeline_stats
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -48,7 +51,26 @@ async def reset_enrichment_stats():
     Reset all statistics.
     """
     reset_stats()
-    return {"status": "reset", "message": "Statistics have been reset"}
+    reset_pipeline_stats()
+    return {"status": "reset", "message": "All statistics have been reset"}
+
+
+@app.get("/dashboard")
+async def get_dashboard():
+    """
+    Pipeline quality dashboard - JSON format.
+    Shows success rates for domain, DM, phone, email across all runs.
+    """
+    return get_pipeline_stats()
+
+
+@app.get("/dashboard/summary")
+async def get_dashboard_summary():
+    """
+    Human-readable pipeline quality dashboard.
+    Shows success rates, domain sources, recent runs.
+    """
+    return PlainTextResponse(content=get_pipeline_dashboard())
 
 
 @app.post("/webhook/enrich")

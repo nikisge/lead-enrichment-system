@@ -51,7 +51,7 @@ from clients.ai_validator import (
 )
 from clients.team_discovery import discover_team_contacts, TeamDiscoveryResult
 
-from utils.stats import track_phone_attempt
+from utils.stats import track_phone_attempt, track_pipeline_result
 from utils.cost_tracker import (
     start_cost_tracking, log_cost_summary,
     track_llm, track_openrouter, track_google,
@@ -1001,6 +1001,12 @@ async def _enrich_lead_inner(
 
     # Log cost summary for this enrichment run
     log_cost_summary()
+
+    # Track pipeline result for persistent quality stats
+    try:
+        track_pipeline_result(result)
+    except Exception as e:
+        logger.warning(f"Failed to track pipeline stats: {e}")
 
     logger.info(f"=== Enrichment complete: success={success}, path={' -> '.join(enrichment_path[:10])}... ===")
     return result
