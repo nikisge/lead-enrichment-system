@@ -42,7 +42,7 @@ class BetterContactClient:
         settings = get_settings()
         self.api_key = settings.bettercontact_api_key
         self.timeout = settings.api_timeout
-        self.max_poll_attempts = 36  # Max 180 seconds polling (3 min)
+        self.max_poll_attempts = 6  # Max 30 seconds polling
         self.poll_interval = 5  # seconds
 
     async def check_credits(self) -> bool:
