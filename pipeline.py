@@ -206,8 +206,19 @@ async def _enrich_lead_inner(
     #
     # 1. Job URL Domain (MOST RELIABLE - if job is on company website)
     # 2. LLM extracted domain (from job description text)
-    # 3. Heuristic (FREE - generates domains from company name)
-    # 4. Google CSE (Fallback - uses API quota)
+    # 3. DuckDuckGo Search (FREE - real web search, best results)
+    # 4. Heuristic (FREE - generates domains from company name)
+    # 5. Google CSE (Last resort - uses API quota, 100 free/day)
+
+    # Build job context for smarter AI domain validation
+    job_context_for_validation = ""
+    if payload.title:
+        job_context_for_validation = f"Jobtitel: {payload.title}"
+    if payload.category:
+        job_context_for_validation += f" | Kategorie: {payload.category}"
+    if payload.description:
+        desc_snippet = payload.description[:200].replace('\n', ' ').strip()
+        job_context_for_validation += f" | {desc_snippet}"
 
     # Priority 1: Extract domain from Job URL (FREE, MOST RELIABLE)
     if not company_info.domain and payload.url:
@@ -215,8 +226,9 @@ async def _enrich_lead_inner(
         if url_domain:
             # Validate that this domain actually belongs to the company
             logger.info(f"Job URL domain found: {url_domain} - validating...")
-            if await _ai_validate_domain(url_domain, parsed.company_name):
+            if await _ai_validate_domain(url_domain, parsed.company_name, job_context=job_context_for_validation):
                 company_info.domain = url_domain
+                company_info.website = f"https://{url_domain}"
                 enrichment_path.append("job_url_domain_found")
                 logger.info(f"✓ Using domain from job URL: {url_domain}")
             else:
@@ -226,7 +238,7 @@ async def _enrich_lead_inner(
     if company_info.domain and parsed.company_name and "job_url_domain_found" not in enrichment_path:
         # LLM found a domain - validate it with AI
         logger.info(f"Validating LLM domain '{company_info.domain}' for '{parsed.company_name}'...")
-        is_valid = await _ai_validate_domain(company_info.domain, parsed.company_name)
+        is_valid = await _ai_validate_domain(company_info.domain, parsed.company_name, job_context=job_context_for_validation)
 
         if not is_valid:
             # Domain doesn't match company - search for alternatives
@@ -235,33 +247,56 @@ async def _enrich_lead_inner(
             company_info.domain = None  # Reset - will search below
         else:
             enrichment_path.append("llm_domain_validated")
+            if not company_info.website:
+                company_info.website = f"https://{company_info.domain}"
 
-    # Priority 3 & 4: Heuristic then Google
+    # Priority 3, 4 & 5: DuckDuckGo, Heuristic, then Google
     if not company_info.domain and parsed.company_name:
-        # Strategy 3: FREE heuristic-based domain discovery (no API costs!)
-        logger.info("No valid domain - trying FREE heuristic search first...")
-        found_domain = await _heuristic_find_domain(parsed.company_name)
-
-        if found_domain:
+        # Strategy 3: DuckDuckGo search (FREE, best results, ~1-2s)
+        logger.info("No valid domain - trying DuckDuckGo search first...")
+        ddg_result = await _duckduckgo_find_domain(
+            company_name=parsed.company_name,
+            job_title=payload.title or "",
+            job_context=job_context_for_validation,
+        )
+        if ddg_result:
+            found_domain, website_url = ddg_result
             company_info.domain = found_domain
-            enrichment_path.append("heuristic_domain_found")
-            logger.info(f"✓ Heuristic found domain: {found_domain}")
+            company_info.website = website_url
+            enrichment_path.append("ddg_domain_found")
+            logger.info(f"✓ DuckDuckGo found domain: {found_domain}")
         else:
-            # Strategy 4: Google CSE as fallback (uses API quota)
-            logger.info("Heuristic failed - falling back to Google search...")
-            found_domain = await _google_find_domain(parsed.company_name, validate_with_ai=True)
-            if found_domain:
-                # Check for subdomain patterns and try main domain too
-                main_domain = _extract_main_domain(found_domain)
-                if main_domain and main_domain != found_domain:
-                    logger.info(f"Found subdomain {found_domain}, also trying main domain {main_domain}")
-                    company_info.domain = main_domain
-                else:
-                    company_info.domain = found_domain
-                enrichment_path.append("google_domain_found")
+            # Strategy 4: Heuristic fallback (FREE, generates domains from company name)
+            logger.info("DuckDuckGo failed - trying heuristic domain search...")
+            heuristic_result = await _heuristic_find_domain(parsed.company_name, job_context=job_context_for_validation)
+
+            if heuristic_result:
+                found_domain, website_url = heuristic_result
+                company_info.domain = found_domain
+                company_info.website = website_url
+                enrichment_path.append("heuristic_domain_found")
+                logger.info(f"✓ Heuristic found domain: {found_domain}")
             else:
-                logger.warning(f"No valid domain found for '{parsed.company_name}'")
-                enrichment_path.append("no_domain_found")
+                # Strategy 5: Google CSE as last resort (uses API quota, 100 free/day)
+                logger.info("Heuristic failed - falling back to Google search...")
+                found_domain = await _google_find_domain(parsed.company_name, validate_with_ai=True)
+                if found_domain:
+                    # Check for subdomain patterns and try main domain too
+                    main_domain = _extract_main_domain(found_domain)
+                    if main_domain and main_domain != found_domain:
+                        logger.info(f"Found subdomain {found_domain}, also trying main domain {main_domain}")
+                        company_info.domain = main_domain
+                    else:
+                        company_info.domain = found_domain
+                    company_info.website = f"https://{company_info.domain}"
+                    enrichment_path.append("google_domain_found")
+                else:
+                    logger.warning(f"No valid domain found for '{parsed.company_name}'")
+                    enrichment_path.append("no_domain_found")
+
+    # Ensure website URL is always set when we have a domain
+    if company_info.domain and not company_info.website:
+        company_info.website = f"https://{company_info.domain}"
 
     # ========== PHASE 2: PARALLEL SCRAPING ==========
 
@@ -1392,7 +1427,7 @@ def _extract_domain_from_job_url(job_url: Optional[str], company_name: str) -> O
         return None
 
 
-async def _heuristic_find_domain(company_name: str) -> Optional[str]:
+async def _heuristic_find_domain(company_name: str, job_context: str = "") -> Optional[tuple]:
     """
     Find company domain using smart heuristics - COMPLETELY FREE!
 
@@ -1400,8 +1435,9 @@ async def _heuristic_find_domain(company_name: str) -> Optional[str]:
     1. Extract meaningful words from company name
     2. Generate possible domain variations
     3. Check if domains exist via HEAD requests (free!)
-    4. Validate with AI
+    4. Validate with AI (with job context for smarter validation)
 
+    Returns: (domain, website_url) tuple or None
     Example: "Gröber Holzbau GmbH" → tries groeber.de, groeber.com, groeber-holzbau.de, etc.
     """
     settings = get_settings()
@@ -1486,9 +1522,9 @@ async def _heuristic_find_domain(company_name: str) -> Optional[str]:
     logger.info(f"Heuristic domain candidates for '{company_name}': {unique_candidates[:10]}")
 
     # Step 3: Check which domains exist AND fetch content to detect parked domains
-    async def check_domain_exists(domain: str) -> tuple[str, bool, str]:
+    async def check_domain_exists(domain: str) -> tuple[str, bool, str, str]:
         """Check if domain exists, has a website, and is NOT a parked domain.
-        Returns (domain, exists, page_snippet) - snippet is first ~5000 chars of HTML."""
+        Returns (domain, exists, page_snippet, scheme) - snippet is first ~5000 chars of HTML."""
         try:
             async with httpx.AsyncClient(
                 timeout=7.0,
@@ -1508,35 +1544,164 @@ async def _heuristic_find_domain(company_name: str) -> Optional[str]:
                             content = response.text[:5000] if response.text else ""
                             if _is_parked_domain(content, domain):
                                 logger.info(f"Parked domain detected: {domain} - skipping")
-                                return (domain, False, "")
-                            return (domain, True, content[:3000])
+                                return (domain, False, "", "")
+                            return (domain, True, content[:3000], scheme)
                     except Exception:
                         continue
-                return (domain, False, "")
+                return (domain, False, "", "")
         except Exception:
-            return (domain, False, "")
+            return (domain, False, "", "")
 
     # Check first 15 candidates in parallel
     tasks = [check_domain_exists(d) for d in unique_candidates[:15]]
     results = await asyncio.gather(*tasks)
 
-    # Filter to existing, non-parked domains (keep content snippets for AI validation)
-    existing_domains = [(domain, snippet) for domain, exists, snippet in results if exists]
+    # Filter to existing, non-parked domains (keep content snippets + scheme for AI validation)
+    existing_domains = [(domain, snippet, scheme) for domain, exists, snippet, scheme in results if exists]
 
     if not existing_domains:
         logger.info(f"No heuristic domains exist for '{company_name}'")
         return None
 
-    logger.info(f"Existing domains for '{company_name}': {[d for d, _ in existing_domains]}")
+    logger.info(f"Existing domains for '{company_name}': {[d for d, _, _ in existing_domains]}")
 
-    # Step 4: Validate with AI (now with page content for smarter validation)
-    for domain, snippet in existing_domains:
-        if await _ai_validate_domain(domain, company_name, page_content=snippet):
+    # Step 4: Validate with AI (with page content + job context for smarter validation)
+    for domain, snippet, scheme in existing_domains:
+        if await _ai_validate_domain(domain, company_name, page_content=snippet, job_context=job_context):
+            website_url = f"{scheme}://{domain}"
             logger.info(f"✓ Heuristic found valid domain: {domain} for '{company_name}'")
-            return domain
+            return (domain, website_url)
 
     logger.warning(f"No heuristic domain passed AI validation for '{company_name}'")
     return None
+
+
+async def _duckduckgo_find_domain(
+    company_name: str,
+    job_title: str = "",
+    job_context: str = "",
+) -> Optional[tuple]:
+    """
+    Find company domain via DuckDuckGo HTML search - FREE, no API key needed.
+
+    Uses DuckDuckGo's HTML endpoint (no JS required) with httpx + BeautifulSoup.
+    No extra dependencies - both are already in requirements.
+
+    Returns: (domain, website_url) tuple or None
+    """
+    try:
+        from bs4 import BeautifulSoup
+
+        query = f"{company_name}"
+        logger.info(f"DuckDuckGo domain search for: {company_name}")
+
+        async with httpx.AsyncClient(
+            timeout=10.0,
+            follow_redirects=True,
+            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+        ) as client:
+            response = await client.post(
+                "https://html.duckduckgo.com/html/",
+                data={"q": query},
+            )
+
+        if response.status_code != 200:
+            logger.warning(f"DuckDuckGo returned status {response.status_code}")
+            return None
+
+        soup = BeautifulSoup(response.text, "html.parser")
+        results = soup.select(".result")
+
+        if not results:
+            logger.info(f"DuckDuckGo returned no results for '{company_name}'")
+            return None
+
+        # Filter out job portals, social media, directories, etc.
+        skip_domains = {
+            'linkedin.com', 'xing.com', 'facebook.com', 'twitter.com',
+            'instagram.com', 'youtube.com', 'wikipedia.org', 'kununu.de',
+            'glassdoor.com', 'indeed.com', 'indeed.de', 'stepstone.de',
+            'stepstone.at', 'monster.de', 'karriere.at', 'jobs.ch',
+            'jobware.de', 'stellenanzeigen.de', 'gehalt.de', 'hokify.de',
+            'hokify.at', 'meinestadt.de', 'arbeitsagentur.de',
+            'dnb.com', 'creditreform.de', 'northdata.com', 'webvalid.de',
+            'opencorpdata.com', 'cylex.de', 'firmenwissen.de', 'unternehmensregister.de',
+        }
+
+        # Extract candidate domains with snippets and actual URLs
+        candidate_domains = []  # (domain, snippet, website_url)
+        seen_domains = set()
+
+        for result in results[:10]:
+            link = result.select_one(".result__a")
+            snippet_el = result.select_one(".result__snippet")
+            if not link:
+                continue
+
+            href = link.get("href", "")
+            snippet = snippet_el.get_text(strip=True) if snippet_el else ""
+            if not href:
+                continue
+
+            parsed_url = urlparse(href)
+            domain = parsed_url.netloc.lower().replace("www.", "")
+
+            if not domain or domain in seen_domains:
+                continue
+            if any(skip in domain for skip in skip_domains):
+                continue
+
+            seen_domains.add(domain)
+            website_url = f"{parsed_url.scheme}://{domain}"
+            candidate_domains.append((domain, snippet, website_url))
+
+        if not candidate_domains:
+            logger.info(f"DuckDuckGo: no valid candidate domains for '{company_name}'")
+            return None
+
+        # Relevance scoring: domains containing company name parts rank higher
+        def domain_relevance_score(domain: str) -> int:
+            name_lower = company_name.lower()
+            for suffix in [' gmbh & co. kgaa', ' gmbh & co. kg', ' gmbh & co kg',
+                          ' partg mbb', ' partg', ' gmbh', ' ggmbh', ' ag', ' kgaa',
+                          ' kg', ' ohg', ' mbh', ' ug', ' gbr', ' eg', ' e.v.', ' co.', ' & co']:
+                name_lower = name_lower.replace(suffix, '')
+            name_words = [w for w in name_lower.split() if len(w) >= 3]
+            domain_base = domain.split('.')[0].lower()
+
+            score = 0
+            for word in name_words:
+                if word in domain_base:
+                    score += 10
+                word_converted = word
+                for umlaut, replacement in [('ä', 'ae'), ('ö', 'oe'), ('ü', 'ue'), ('ß', 'ss')]:
+                    word_converted = word_converted.replace(umlaut, replacement)
+                if word_converted != word and word_converted in domain_base:
+                    score += 10
+            return score
+
+        # Sort by relevance, take top 5
+        scored = [(d, s, u, domain_relevance_score(d)) for d, s, u in candidate_domains]
+        scored.sort(key=lambda x: -x[3])
+
+        logger.info(f"DuckDuckGo candidates for '{company_name}': {[(d, sc) for d, _, _, sc in scored[:5]]}")
+
+        # AI-validate top 5, passing snippet as page_content + job_context
+        for domain, snippet, website_url, score in scored[:5]:
+            if await _ai_validate_domain(
+                domain, company_name,
+                page_content=snippet,
+                job_context=job_context,
+            ):
+                logger.info(f"✓ DuckDuckGo found valid domain: {domain} for '{company_name}'")
+                return (domain, website_url)
+
+        logger.info(f"DuckDuckGo: no domain passed AI validation for '{company_name}'")
+        return None
+
+    except Exception as e:
+        logger.warning(f"DuckDuckGo domain search failed: {e}")
+        return None
 
 
 def _is_parked_domain(html_content: str, domain: str = "") -> bool:
@@ -1622,10 +1787,10 @@ def _is_parked_domain(html_content: str, domain: str = "") -> bool:
     return False
 
 
-async def _ai_validate_domain(domain: str, company_name: str, page_content: str = "") -> bool:
+async def _ai_validate_domain(domain: str, company_name: str, page_content: str = "", job_context: str = "") -> bool:
     """
     Use AI to check if a domain belongs to the company.
-    Now optionally includes page content snippet for smarter validation.
+    Includes page content snippet and job context for smarter validation.
     Returns True if domain matches, False otherwise.
     """
     try:
@@ -1641,12 +1806,19 @@ async def _ai_validate_domain(domain: str, company_name: str, page_content: str 
             if text_snippet:
                 content_context = f'\nInhalt der Webseite (Ausschnitt): "{text_snippet}"'
 
+        # Build job context hint if available
+        job_hint = ""
+        if job_context:
+            job_hint = f'\nKontext der Stellenanzeige: "{job_context[:300]}"'
+
         prompt = f"""Prüfe ob die Domain "{domain}" zur Firma "{company_name}" gehört.
-{content_context}
+{content_context}{job_hint}
 WICHTIG:
 - Die Domain muss zur EINSTELLENDEN FIRMA gehören
 - NICHT zu einer Personalvermittlung, Recruiting-Agentur oder Jobportal
 - Wenn der Webseiteninhalt vorhanden ist, prüfe ob er zur Firma passt
+- Wenn Stellenanzeigen-Kontext vorhanden ist, prüfe ob die Branche/Tätigkeit zur Webseite passt
+- Bei gleichem Firmennamen aber ANDERER Branche/Tätigkeit = KEIN Match
 - Eine Domain-Kauf-Seite oder leere Seite = KEIN Match
 
 Antworte NUR mit JSON:
