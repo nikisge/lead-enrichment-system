@@ -1,5 +1,5 @@
 from pydantic import BaseModel, Field, field_validator
-from typing import Optional, List
+from typing import Optional, List, Dict
 from enum import Enum
 
 
@@ -129,6 +129,9 @@ class EnrichmentResult(BaseModel):
 
     # Warnings for n8n alerts (e.g. "primary_api_key_failed", "used_fallback_api_key")
     warnings: List[str] = Field(default_factory=list)
+
+    # Operational alerts for n8n monitoring (extra fields, don't affect existing output)
+    operational_alerts: Dict[str, bool] = Field(default_factory=dict)
 
     # Original input reference
     job_id: str

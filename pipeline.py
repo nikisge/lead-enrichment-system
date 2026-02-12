@@ -180,6 +180,16 @@ async def _enrich_lead_inner(
     """
     enrichment_path = []
     collected_emails: List[str] = []
+    operational_alerts: Dict[str, bool] = {}
+
+    # Check critical API keys at startup
+    settings = get_settings()
+    if not settings.anthropic_api_key:
+        operational_alerts["anthropic_key_missing"] = True
+        logger.warning("ALERT: Anthropic API key is missing!")
+    if not settings.openrouter_api_key:
+        operational_alerts["openrouter_key_missing"] = True
+        logger.warning("ALERT: OpenRouter API key is missing!")
 
     # Start cost tracking for this enrichment run
     cost_tracker = start_cost_tracking(payload.company)
@@ -254,11 +264,17 @@ async def _enrich_lead_inner(
     if not company_info.domain and parsed.company_name:
         # Strategy 3: DuckDuckGo search (FREE, best results, ~1-2s)
         logger.info("No valid domain - trying DuckDuckGo search first...")
-        ddg_result = await _duckduckgo_find_domain(
-            company_name=parsed.company_name,
-            job_title=payload.title or "",
-            job_context=job_context_for_validation,
-        )
+        ddg_result = None
+        try:
+            ddg_result = await _duckduckgo_find_domain(
+                company_name=parsed.company_name,
+                job_title=payload.title or "",
+                job_context=job_context_for_validation,
+            )
+        except Exception as e:
+            logger.warning(f"DuckDuckGo search error: {e}")
+            operational_alerts["ddg_search_error"] = True
+            enrichment_path.append("ddg_error")
         if ddg_result:
             found_domain, website_url = ddg_result
             company_info.domain = found_domain
@@ -978,6 +994,7 @@ async def _enrich_lead_inner(
         emails=unique_emails,
         enrichment_path=enrichment_path,
         warnings=warnings,
+        operational_alerts=operational_alerts,
         job_id=payload.id,
         job_title=payload.title
     )
@@ -1588,33 +1605,32 @@ async def _duckduckgo_find_domain(
     No extra dependencies - both are already in requirements.
 
     Returns: (domain, website_url) tuple or None
+    Raises: Exception on HTTP/parsing errors (DDG broken/blocked)
     """
-    try:
-        from bs4 import BeautifulSoup
+    from bs4 import BeautifulSoup
 
-        query = f"{company_name}"
-        logger.info(f"DuckDuckGo domain search for: {company_name}")
+    query = f"{company_name}"
+    logger.info(f"DuckDuckGo domain search for: {company_name}")
 
-        async with httpx.AsyncClient(
-            timeout=10.0,
-            follow_redirects=True,
-            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-        ) as client:
-            response = await client.post(
-                "https://html.duckduckgo.com/html/",
-                data={"q": query},
-            )
+    async with httpx.AsyncClient(
+        timeout=10.0,
+        follow_redirects=True,
+        headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+    ) as client:
+        response = await client.post(
+            "https://html.duckduckgo.com/html/",
+            data={"q": query},
+        )
 
-        if response.status_code != 200:
-            logger.warning(f"DuckDuckGo returned status {response.status_code}")
-            return None
+    if response.status_code != 200:
+        raise RuntimeError(f"DuckDuckGo HTTP {response.status_code}")
 
-        soup = BeautifulSoup(response.text, "html.parser")
-        results = soup.select(".result")
+    soup = BeautifulSoup(response.text, "html.parser")
+    results = soup.select(".result")
 
-        if not results:
-            logger.info(f"DuckDuckGo returned no results for '{company_name}'")
-            return None
+    if not results:
+        # No .result elements = likely rate-limited or HTML structure changed
+        raise RuntimeError("DuckDuckGo returned no .result elements - possibly rate-limited or HTML changed")
 
         # Filter out job portals, social media, directories, etc.
         skip_domains = {
@@ -1696,12 +1712,8 @@ async def _duckduckgo_find_domain(
                 logger.info(f"✓ DuckDuckGo found valid domain: {domain} for '{company_name}'")
                 return (domain, website_url)
 
-        logger.info(f"DuckDuckGo: no domain passed AI validation for '{company_name}'")
-        return None
-
-    except Exception as e:
-        logger.warning(f"DuckDuckGo domain search failed: {e}")
-        return None
+    logger.info(f"DuckDuckGo: no domain passed AI validation for '{company_name}'")
+    return None
 
 
 def _is_parked_domain(html_content: str, domain: str = "") -> bool:
