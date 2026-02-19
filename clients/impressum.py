@@ -1,6 +1,7 @@
 import logging
 import re
 import httpx
+import xml.etree.ElementTree as ET
 from typing import Optional, List
 from bs4 import BeautifulSoup
 from dataclasses import dataclass
@@ -47,8 +48,6 @@ class ImpressumScraper:
 
     def __init__(self):
         settings = get_settings()
-        self.google_api_key = settings.google_api_key
-        self.google_cse_id = settings.google_cse_id
         self.timeout = settings.api_timeout
 
     async def scrape(
@@ -77,19 +76,20 @@ class ImpressumScraper:
                 f"https://www.{clean_domain}/kontakt",
             ])
 
-        # Try to scrape each URL
+        # Tier 1: Try direct URLs
         for url in urls_to_try:
             result = await self._scrape_url(url)
             if result and result.success:
                 return result
 
-        # Fallback: Google search
-        if self.google_api_key and self.google_cse_id:
-            google_url = await self._google_search(company_name, domain)
-            if google_url:
-                result = await self._scrape_url(google_url)
-                if result and result.success:
-                    return result
+        # Tier 2: Sitemap check (1 HTTP request, no API cost)
+        if domain:
+            sitemap_urls = await self._find_impressum_in_sitemap(domain)
+            for url in sitemap_urls:
+                if url not in urls_to_try:
+                    result = await self._scrape_url(url)
+                    if result and result.success:
+                        return result
 
         return None
 
@@ -364,48 +364,53 @@ class ImpressumScraper:
 
         return sorted(members, key=score, reverse=True)
 
-    async def _google_search(
-        self,
-        company_name: str,
-        domain: Optional[str]
-    ) -> Optional[str]:
-        """Use Google Custom Search to find Impressum page."""
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
-            query = f'"{company_name}" impressum'
-            if domain:
-                query += f" site:{domain}"
+    async def _find_impressum_in_sitemap(self, domain: str) -> List[str]:
+        """Check sitemap.xml for impressum/kontakt URLs."""
+        clean_domain = domain.replace("www.", "")
+        sitemap_urls = [
+            f"https://{clean_domain}/sitemap.xml",
+            f"https://www.{clean_domain}/sitemap.xml",
+        ]
 
-            url = "https://www.googleapis.com/customsearch/v1"
-            params = {
-                "key": self.google_api_key,
-                "cx": self.google_cse_id,
-                "q": query,
-                "num": 3
-            }
+        impressum_keywords = ['impressum', 'kontakt', 'contact', 'imprint']
+        found_urls = []
 
-            try:
-                response = await client.get(url, params=params)
-                response.raise_for_status()
-                data = response.json()
+        async with httpx.AsyncClient(
+            timeout=10,
+            follow_redirects=True,
+            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+        ) as client:
+            for sitemap_url in sitemap_urls:
+                try:
+                    response = await client.get(sitemap_url)
+                    if response.status_code != 200:
+                        continue
 
-                items = data.get("items", [])
-                for item in items:
-                    link = item.get("link", "")
-                    # Prefer Impressum pages
-                    if "impressum" in link.lower():
-                        return link
-                    # Or kontakt pages
-                    if "kontakt" in link.lower():
-                        return link
+                    root = ET.fromstring(response.text)
+                    namespaces = {'ns': 'http://www.sitemaps.org/schemas/sitemap/0.9'}
+                    urls = root.findall('.//ns:url/ns:loc', namespaces)
+                    if not urls:
+                        urls = root.findall('.//url/loc')
 
-                # Return first result if no Impressum found
-                if items:
-                    return items[0].get("link")
+                    for url_elem in urls:
+                        url = url_elem.text
+                        if url and any(kw in url.lower() for kw in impressum_keywords):
+                            found_urls.append(url)
 
-            except Exception as e:
-                logger.warning(f"Google search failed: {e}")
+                    if found_urls:
+                        break
 
-            return None
+                except Exception as e:
+                    logger.debug(f"Sitemap check failed: {sitemap_url} - {e}")
+                    continue
+
+        # Prioritize: impressum > kontakt > contact > imprint
+        found_urls.sort(key=lambda u: next(
+            (i for i, kw in enumerate(impressum_keywords) if kw in u.lower()), 99
+        ))
+
+        logger.info(f"Sitemap discovery for {domain}: found {len(found_urls)} impressum URLs")
+        return found_urls[:3]
 
     async def _scrape_url(self, url: str) -> Optional[ImpressumResult]:
         """Scrape a URL for contact information. Uses httpx first, Playwright as fallback."""
@@ -503,12 +508,16 @@ class ImpressumScraper:
         phones = []
         seen = set()
 
-        # German phone patterns - order matters, more specific first
+        # DACH phone patterns - order matters, more specific first
         patterns = [
-            # +49 format with full number
+            # +49 Germany
             r'\+49\s*\(?\d{1,4}\)?\s*[\d\s\-/\.]{6,}',
-            # 0049 format
-            r'0049\s*\(?\d{1,4}\)?\s*[\d\s\-/\.]{6,}',
+            # +43 Austria
+            r'\+43\s*\(?\d{1,4}\)?\s*[\d\s\-/\.]{6,}',
+            # +41 Switzerland
+            r'\+41\s*\(?\d{1,4}\)?\s*[\d\s\-/\.]{6,}',
+            # 0049/0043/0041 format
+            r'00(?:49|43|41)\s*\(?\d{1,4}\)?\s*[\d\s\-/\.]{6,}',
             # Local format with area code (0xxx followed by number)
             r'0[1-9]\d{2,4}\s*[-/\s\.]*\d{2,}[\d\s\-/\.]*',
             # Labeled patterns - capture the full number after label
@@ -569,29 +578,34 @@ class ImpressumScraper:
         return list(set(filtered))
 
     def _clean_phone_number(self, raw: str) -> str:
-        """Clean and normalize phone number."""
-        # Remove label text
-        raw = re.sub(r'^.*?(?=[\d+])', '', raw)
+        """Clean and normalize phone number for DACH countries."""
+        # Remove label text (everything before first digit or +)
+        raw = re.sub(r'^[^\d+]+', '', raw)
         # Keep only digits and +
         cleaned = re.sub(r'[^\d+]', '', raw)
 
-        # Normalize to +49 format
+        # Normalize DACH country codes
         if cleaned.startswith('+49'):
-            # Remove extra 0 after +49 if present
             cleaned = re.sub(r'^\+490', '+49', cleaned)
+        elif cleaned.startswith('+43'):
+            cleaned = re.sub(r'^\+430', '+43', cleaned)
+        elif cleaned.startswith('+41'):
+            cleaned = re.sub(r'^\+410', '+41', cleaned)
         elif cleaned.startswith('0049'):
-            # Convert 0049 to +49
             cleaned = '+49' + cleaned[4:].lstrip('0')
+        elif cleaned.startswith('0043'):
+            cleaned = '+43' + cleaned[4:].lstrip('0')
+        elif cleaned.startswith('0041'):
+            cleaned = '+41' + cleaned[4:].lstrip('0')
         elif cleaned.startswith('0'):
-            # Convert leading 0 to +49
-            cleaned = '+49' + cleaned[1:]
+            cleaned = '+49' + cleaned[1:]  # Default to German
         elif len(cleaned) >= 10 and not cleaned.startswith('+'):
-            # Assume German number without prefix, add +49
             cleaned = '+49' + cleaned
 
-        # FIX: Remove duplicate country code (+4949 -> +49)
-        # This happens when source has formats like "+49 (0)49 89..." or "0049 49 89..."
+        # Fix duplicate country codes
         cleaned = re.sub(r'^\+4949', '+49', cleaned)
+        cleaned = re.sub(r'^\+4343', '+43', cleaned)
+        cleaned = re.sub(r'^\+4141', '+41', cleaned)
 
         return cleaned
 
