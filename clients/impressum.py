@@ -408,7 +408,22 @@ class ImpressumScraper:
             return None
 
     async def _scrape_url(self, url: str) -> Optional[ImpressumResult]:
-        """Scrape a URL for contact information."""
+        """Scrape a URL for contact information. Uses httpx first, Playwright as fallback."""
+        # 1. Try httpx (fast, ~0.5s)
+        html = await self._fetch_with_httpx(url)
+
+        # 2. Fallback: Playwright (slower ~3-5s, but tolerates broken headers)
+        if not html:
+            html = await self._fetch_with_playwright(url)
+
+        if not html:
+            return None
+
+        # 3. Parse HTML for contact info
+        return self._parse_impressum_html(html, url)
+
+    async def _fetch_with_httpx(self, url: str) -> Optional[str]:
+        """Fetch page HTML via httpx. Returns None on any error."""
         async with httpx.AsyncClient(
             timeout=self.timeout,
             follow_redirects=True,
@@ -419,34 +434,69 @@ class ImpressumScraper:
             try:
                 response = await client.get(url)
                 response.raise_for_status()
-
-                soup = BeautifulSoup(response.text, "lxml")
-                text = soup.get_text(separator=" ")
-
-                phones = self._extract_phones(text)
-                emails = self._extract_emails(text)
-                address = self._extract_address(text)
-
-                # Extract base website URL from the scraped page
-                website_url = self._get_base_url(str(response.url))
-
-                logger.info(f"Impressum {url}: {len(phones)} phones, {len(emails)} emails, address={address is not None}")
-
-                return ImpressumResult(
-                    phones=phones,
-                    emails=emails,
-                    website_url=website_url,
-                    address=address,
-                    raw_text=text[:10000],  # Keep raw text for AI extraction
-                    success=len(phones) > 0 or len(emails) > 0 or address is not None
-                )
-
+                return response.text
             except httpx.HTTPStatusError as e:
                 logger.debug(f"Impressum page not found: {url} ({e.response.status_code})")
                 return None
             except Exception as e:
-                logger.debug(f"Impressum scrape failed: {url} - {e}")
+                logger.debug(f"httpx failed for {url}: {e}, will try Playwright fallback")
                 return None
+
+    async def _fetch_with_playwright(self, url: str) -> Optional[str]:
+        """Fetch page HTML via Playwright. Tolerates broken HTTP headers."""
+        try:
+            from playwright.async_api import async_playwright
+            from clients.job_scraper import _playwright_semaphore
+
+            async with _playwright_semaphore:
+                async with async_playwright() as p:
+                    browser = await p.chromium.launch(
+                        headless=True,
+                        args=['--disable-http2', '--disable-blink-features=AutomationControlled']
+                    )
+                    try:
+                        context = await browser.new_context(
+                            viewport={'width': 1280, 'height': 720},
+                            user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                            extra_http_headers={
+                                'Accept-Language': 'de-DE,de;q=0.9,en;q=0.8',
+                            }
+                        )
+                        page = await context.new_page()
+                        await page.goto(url, wait_until='domcontentloaded', timeout=10000)
+                        await page.wait_for_timeout(1000)
+                        html = await page.content()
+                        logger.info(f"Playwright fallback succeeded for {url} ({len(html)} bytes)")
+                        return html
+                    finally:
+                        await browser.close()
+
+        except Exception as e:
+            logger.warning(f"Playwright fallback also failed for {url}: {e}")
+            return None
+
+    def _parse_impressum_html(self, html: str, url: str) -> Optional[ImpressumResult]:
+        """Parse HTML for phones, emails, address. Returns ImpressumResult."""
+        soup = BeautifulSoup(html, "lxml")
+        text = soup.get_text(separator=" ")
+
+        phones = self._extract_phones(text)
+        emails = self._extract_emails(text)
+        address = self._extract_address(text)
+
+        # Extract base website URL
+        website_url = self._get_base_url(url)
+
+        logger.info(f"Impressum {url}: {len(phones)} phones, {len(emails)} emails, address={address is not None}")
+
+        return ImpressumResult(
+            phones=phones,
+            emails=emails,
+            website_url=website_url,
+            address=address,
+            raw_text=text[:10000],
+            success=len(phones) > 0 or len(emails) > 0 or address is not None
+        )
 
     def _extract_phones(self, text: str) -> List[PhoneResult]:
         """Extract phone numbers from text."""
