@@ -1638,85 +1638,88 @@ async def _duckduckgo_find_domain(
         # No .result elements = likely rate-limited or HTML structure changed
         raise RuntimeError("DuckDuckGo returned no .result elements - possibly rate-limited or HTML changed")
 
-        # Filter out job portals, social media, directories, etc.
-        skip_domains = {
-            'linkedin.com', 'xing.com', 'facebook.com', 'twitter.com',
-            'instagram.com', 'youtube.com', 'wikipedia.org', 'kununu.de',
-            'glassdoor.com', 'indeed.com', 'indeed.de', 'stepstone.de',
-            'stepstone.at', 'monster.de', 'karriere.at', 'jobs.ch',
-            'jobware.de', 'stellenanzeigen.de', 'gehalt.de', 'hokify.de',
-            'hokify.at', 'meinestadt.de', 'arbeitsagentur.de',
-            'dnb.com', 'creditreform.de', 'northdata.com', 'webvalid.de',
-            'opencorpdata.com', 'cylex.de', 'firmenwissen.de', 'unternehmensregister.de',
-        }
+    # Filter out job portals, social media, directories, etc.
+    skip_domains = {
+        'linkedin.com', 'xing.com', 'facebook.com', 'twitter.com',
+        'instagram.com', 'youtube.com', 'wikipedia.org', 'kununu.de',
+        'glassdoor.com', 'indeed.com', 'indeed.de', 'stepstone.de',
+        'stepstone.at', 'monster.de', 'karriere.at', 'jobs.ch',
+        'jobware.de', 'stellenanzeigen.de', 'gehalt.de', 'hokify.de',
+        'hokify.at', 'meinestadt.de', 'arbeitsagentur.de',
+        'dnb.com', 'creditreform.de', 'northdata.com', 'webvalid.de',
+        'opencorpdata.com', 'cylex.de', 'firmenwissen.de', 'unternehmensregister.de',
+        'northdata.de', 'wlw.de', 'kompany.de',
+        'handelsregister.de', 'bundesanzeiger.de',
+        'google.com', 'google.de',
+    }
 
-        # Extract candidate domains with snippets and actual URLs
-        candidate_domains = []  # (domain, snippet, website_url)
-        seen_domains = set()
+    # Extract candidate domains with snippets and actual URLs
+    candidate_domains = []  # (domain, snippet, website_url)
+    seen_domains = set()
 
-        for result in results[:10]:
-            link = result.select_one(".result__a")
-            snippet_el = result.select_one(".result__snippet")
-            if not link:
-                continue
+    for result in results[:10]:
+        link = result.select_one(".result__a")
+        snippet_el = result.select_one(".result__snippet")
+        if not link:
+            continue
 
-            href = link.get("href", "")
-            snippet = snippet_el.get_text(strip=True) if snippet_el else ""
-            if not href:
-                continue
+        href = link.get("href", "")
+        snippet = snippet_el.get_text(strip=True) if snippet_el else ""
+        if not href:
+            continue
 
-            parsed_url = urlparse(href)
-            domain = parsed_url.netloc.lower().replace("www.", "")
+        parsed_url = urlparse(href)
+        domain = parsed_url.netloc.lower().replace("www.", "")
 
-            if not domain or domain in seen_domains:
-                continue
-            if any(skip in domain for skip in skip_domains):
-                continue
+        if not domain or domain in seen_domains:
+            continue
+        if any(skip in domain for skip in skip_domains):
+            continue
 
-            seen_domains.add(domain)
-            website_url = f"{parsed_url.scheme}://{domain}"
-            candidate_domains.append((domain, snippet, website_url))
+        seen_domains.add(domain)
+        website_url = f"{parsed_url.scheme}://{domain}"
+        candidate_domains.append((domain, snippet, website_url))
 
-        if not candidate_domains:
-            logger.info(f"DuckDuckGo: no valid candidate domains for '{company_name}'")
-            return None
+    if not candidate_domains:
+        logger.info(f"DuckDuckGo: no valid candidate domains for '{company_name}'")
+        return None
 
-        # Relevance scoring: domains containing company name parts rank higher
-        def domain_relevance_score(domain: str) -> int:
-            name_lower = company_name.lower()
-            for suffix in [' gmbh & co. kgaa', ' gmbh & co. kg', ' gmbh & co kg',
-                          ' partg mbb', ' partg', ' gmbh', ' ggmbh', ' ag', ' kgaa',
-                          ' kg', ' ohg', ' mbh', ' ug', ' gbr', ' eg', ' e.v.', ' co.', ' & co']:
-                name_lower = name_lower.replace(suffix, '')
-            name_words = [w for w in name_lower.split() if len(w) >= 3]
-            domain_base = domain.split('.')[0].lower()
+    # Relevance scoring: domains containing company name parts rank higher
+    def domain_relevance_score(domain: str) -> int:
+        name_lower = company_name.lower()
+        for suffix in [' gmbh & co. kgaa', ' gmbh & co. kg', ' gmbh & co kg',
+                      ' partg mbb', ' partg', ' gmbh', ' ggmbh', ' ag', ' kgaa',
+                      ' kg', ' ohg', ' mbh', ' ug', ' gbr', ' eg', ' e.v.', ' co.', ' & co']:
+            name_lower = name_lower.replace(suffix, '')
+        name_words = [w for w in name_lower.split() if len(w) >= 3]
+        domain_base = domain.split('.')[0].lower()
 
-            score = 0
-            for word in name_words:
-                if word in domain_base:
-                    score += 10
-                word_converted = word
-                for umlaut, replacement in [('ä', 'ae'), ('ö', 'oe'), ('ü', 'ue'), ('ß', 'ss')]:
-                    word_converted = word_converted.replace(umlaut, replacement)
-                if word_converted != word and word_converted in domain_base:
-                    score += 10
-            return score
+        score = 0
+        for word in name_words:
+            if word in domain_base:
+                score += 10
+            word_converted = word
+            for umlaut, replacement in [('ä', 'ae'), ('ö', 'oe'), ('ü', 'ue'), ('ß', 'ss')]:
+                word_converted = word_converted.replace(umlaut, replacement)
+            if word_converted != word and word_converted in domain_base:
+                score += 10
+        return score
 
-        # Sort by relevance, take top 5
-        scored = [(d, s, u, domain_relevance_score(d)) for d, s, u in candidate_domains]
-        scored.sort(key=lambda x: -x[3])
+    # Sort by relevance, take top 5
+    scored = [(d, s, u, domain_relevance_score(d)) for d, s, u in candidate_domains]
+    scored.sort(key=lambda x: -x[3])
 
-        logger.info(f"DuckDuckGo candidates for '{company_name}': {[(d, sc) for d, _, _, sc in scored[:5]]}")
+    logger.info(f"DuckDuckGo candidates for '{company_name}': {[(d, sc) for d, _, _, sc in scored[:5]]}")
 
-        # AI-validate top 5, passing snippet as page_content + job_context
-        for domain, snippet, website_url, score in scored[:5]:
-            if await _ai_validate_domain(
-                domain, company_name,
-                page_content=snippet,
-                job_context=job_context,
-            ):
-                logger.info(f"✓ DuckDuckGo found valid domain: {domain} for '{company_name}'")
-                return (domain, website_url)
+    # AI-validate top 5, passing snippet as page_content + job_context
+    for domain, snippet, website_url, score in scored[:5]:
+        if await _ai_validate_domain(
+            domain, company_name,
+            page_content=snippet,
+            job_context=job_context,
+        ):
+            logger.info(f"✓ DuckDuckGo found valid domain: {domain} for '{company_name}'")
+            return (domain, website_url)
 
     logger.info(f"DuckDuckGo: no domain passed AI validation for '{company_name}'")
     return None

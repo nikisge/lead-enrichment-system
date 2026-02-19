@@ -170,7 +170,7 @@ WICHTIG:
 - Unterscheide zwischen persönlichen und allgemeinen Kontaktdaten
 
 Extrahiere:
-1. executives: Geschäftsführer, Inhaber, Vorstände mit Name und Titel
+1. executives: Geschäftsführer, Inhaber, Vorstände, Vertretungsberechtigte (auch "Vertreten durch:") mit Name und Titel
 2. phones: Alle Telefonnummern mit Typ (zentrale/mobil/fax/direkt)
 3. emails: Alle E-Mails mit Typ (allgemein/persönlich/support)
 4. address: Vollständige Adresse

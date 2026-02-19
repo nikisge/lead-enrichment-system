@@ -73,6 +73,14 @@ async def get_dashboard_summary():
     return PlainTextResponse(content=get_pipeline_dashboard())
 
 
+@app.get("/dashboard/recent")
+async def get_dashboard_recent(n: int = Query(60, ge=1, le=100)):
+    """Letzte N Pipeline-Runs als JSON — für Kunden-Reports."""
+    stats = get_pipeline_stats()
+    recent = stats.get("recent_runs", [])
+    return recent[-n:]
+
+
 @app.post("/webhook/enrich")
 async def webhook_enrich(
     payload: WebhookPayload,

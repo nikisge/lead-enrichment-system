@@ -235,6 +235,8 @@ def _get_default_pipeline_stats() -> Dict[str, Any]:
         "phone_found": 0,
         "phone_source": {},
         "email_found": 0,
+        "company_phone_found": 0,
+        "company_address_found": 0,
         "company_research_done": 0,
         "timeouts": 0,
         "recent_runs": [],
@@ -285,6 +287,16 @@ def track_pipeline_result(result) -> None:
         if has_email:
             stats["email_found"] += 1
 
+        # Company phone found?
+        has_company_phone = result.company.phone is not None
+        if has_company_phone:
+            stats["company_phone_found"] = stats.get("company_phone_found", 0) + 1
+
+        # Company address found?
+        has_company_address = bool(result.company.address)
+        if has_company_address:
+            stats["company_address_found"] = stats.get("company_address_found", 0) + 1
+
         # Company research?
         if "company_research" in path:
             stats["company_research_done"] += 1
@@ -293,20 +305,28 @@ def track_pipeline_result(result) -> None:
         if "pipeline_timeout" in path:
             stats["timeouts"] += 1
 
-        # Recent runs log (keep last 50)
+        # Recent runs log (keep last 100)
         stats["recent_runs"].append({
             "timestamp": datetime.now().isoformat(),
             "company": result.company.name,
             "domain": result.company.domain,
+            "company_phone": result.company.phone,
+            "company_address": bool(result.company.address),
             "dm_name": result.decision_maker.name if result.decision_maker else None,
+            "dm_title": result.decision_maker.title if result.decision_maker else None,
+            "dm_linkedin": result.decision_maker.linkedin_url if result.decision_maker else None,
+            "dm_email": result.decision_maker.email if result.decision_maker else None,
             "dm_verified": result.decision_maker.verified_current if result.decision_maker else False,
             "phone_found": has_phone,
+            "phone_number": result.phone.number if result.phone else None,
             "phone_source": result.phone.source.value if result.phone else None,
+            "phone_status": result.phone_status.value,
             "emails_count": len(result.emails),
+            "job_title": result.job_title,
             "success": result.success,
         })
-        if len(stats["recent_runs"]) > 50:
-            stats["recent_runs"] = stats["recent_runs"][-50:]
+        if len(stats["recent_runs"]) > 100:
+            stats["recent_runs"] = stats["recent_runs"][-100:]
 
         _save_pipeline_stats(stats)
 
@@ -331,6 +351,8 @@ def get_pipeline_dashboard() -> str:
     li_verified = stats.get("linkedin_verified", 0)
     phone = stats.get("phone_found", 0)
     email = stats.get("email_found", 0)
+    company_phone = stats.get("company_phone_found", 0)
+    company_address = stats.get("company_address_found", 0)
     research = stats.get("company_research_done", 0)
     timeouts = stats.get("timeouts", 0)
 
@@ -341,12 +363,16 @@ def get_pipeline_dashboard() -> str:
         f"Total Runs:           {total}",
         f"Last Updated:         {stats.get('last_updated', 'N/A')}",
         "",
-        "--- SUCCESS RATES ---",
-        f"  Website/Domain:     {domain}/{total} ({pct(domain)})",
-        f"  Ansprechpartner:    {dm}/{total} ({pct(dm)})",
+        "--- KUNDEN-ÜBERSICHT ---",
+        f"  Website/Domain:        {domain}/{total} ({pct(domain)})",
+        f"  Firmentelefon:         {company_phone}/{total} ({pct(company_phone)})",
+        f"  Ansprechpartner:       {dm}/{total} ({pct(dm)})",
+        f"  Telefon Ansprechp.:    {phone}/{total} ({pct(phone)})",
+        f"  Email Ansprechp.:      {email}/{total} ({pct(email)})",
+        "",
+        "--- DETAILS ---",
         f"  LinkedIn Verified:  {li_verified}/{total} ({pct(li_verified)})",
-        f"  Phone Found:        {phone}/{total} ({pct(phone)})",
-        f"  Email Found:        {email}/{total} ({pct(email)})",
+        f"  Firmenadresse:      {company_address}/{total} ({pct(company_address)})",
         f"  Company Research:   {research}/{total} ({pct(research)})",
         f"  Timeouts:           {timeouts}/{total} ({pct(timeouts)})",
         "",
@@ -375,11 +401,12 @@ def get_pipeline_dashboard() -> str:
         lines.append("")
         lines.append(f"--- LAST {min(len(recent), 10)} RUNS ---")
         for run in recent[-10:]:
-            phone_icon = "TEL" if run.get("phone_found") else "---"
+            dm_phone = "TEL" if run.get("phone_found") else "---"
+            co_phone = "FIR" if run.get("company_phone") else "---"
             dm_name = run.get("dm_name", "---") or "---"
-            domain = run.get("domain", "---") or "---"
-            company = run.get("company", "???")[:30]
-            lines.append(f"  [{phone_icon}] {company:<30} | {domain:<25} | {dm_name}")
+            domain_val = run.get("domain", "---") or "---"
+            company = run.get("company", "???")[:25]
+            lines.append(f"  [{co_phone}|{dm_phone}] {company:<25} | {domain_val:<22} | {dm_name}")
 
     return "\n".join(lines)
 
