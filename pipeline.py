@@ -60,6 +60,70 @@ from utils.cost_tracker import (
 
 logger = logging.getLogger(__name__)
 
+# Domains to skip in search results (job portals, social media, directories, etc.)
+# Shared across DDG, Serper, Google CSE domain discovery
+SKIP_DOMAINS = frozenset({
+    # Social / Professional Networks
+    'linkedin.com', 'xing.com', 'facebook.com', 'twitter.com',
+    'instagram.com', 'youtube.com', 'wikipedia.org',
+    # Job Portals (DE/AT/CH)
+    'kununu.de', 'glassdoor.com', 'glassdoor.de',
+    'indeed.com', 'indeed.de', 'stepstone.de', 'stepstone.at', 'stepstone.ch',
+    'monster.de', 'monster.at', 'monster.ch',
+    'karriere.at', 'jobs.ch', 'jobware.de', 'stellenanzeigen.de',
+    'gehalt.de', 'hokify.de', 'hokify.at', 'meinestadt.de', 'arbeitsagentur.de',
+    # Business Directories / Data
+    'dnb.com', 'creditreform.de', 'northdata.com', 'webvalid.de',
+    'opencorpdata.com', 'cylex.de', 'firmenwissen.de', 'unternehmensregister.de',
+    'northdata.de', 'wlw.de', 'kompany.de',
+    'handelsregister.de', 'bundesanzeiger.de',
+    # Search Engines
+    'google.com', 'google.de',
+    # Misc Directories
+    'implisense.com', '11880.com', 'zaubee.com', 'sortlist.com',
+    'sortlist.de', 'freelancermap.de', 'wer-zu-wem.de',
+    'unternehmen24.info', 'unternehmensverzeichnis.org',
+    'firmenabc.at', 'herold.at', 'zefix.ch',
+    # ATS / Recruiting Platforms
+    'join.com', 'onlyfy.com', 'breezy.hr', 'bamboohr.com', 'ashbyhq.com',
+    'dvinci.de', 'coveto.de', 'd.vinci.de',
+    'personio.de', 'softgarden.de', 'recruitingapp.com',
+    'workday.com', 'greenhouse.io', 'lever.co', 'recruitee.com',
+    'icims.com', 'taleo.net', 'successfactors.com',
+    'smartrecruiters.com', 'jobvite.com', 'workable.com',
+})
+
+
+def _domain_relevance_score(domain: str, company_name: str) -> int:
+    """Score how relevant a domain is for a company name.
+    Higher score = more relevant. Handles umlauts in both directions."""
+    name_lower = company_name.lower()
+    for suffix in [' gmbh & co. kgaa', ' gmbh & co. kg', ' gmbh & co kg',
+                  ' partg mbb', ' partg', ' gmbh', ' ggmbh', ' ag', ' kgaa',
+                  ' kg', ' ohg', ' mbh', ' ug', ' gbr', ' eg', ' e.v.', ' co.', ' & co']:
+        name_lower = name_lower.replace(suffix, '')
+    name_words = [w for w in name_lower.split() if len(w) >= 3]
+    domain_base = domain.split('.')[0].lower()
+
+    score = 0
+    for word in name_words:
+        # Direct match
+        if word in domain_base:
+            score += 10
+        # Umlaut -> ASCII (ö -> oe)
+        word_converted = word
+        for umlaut, replacement in [('ä', 'ae'), ('ö', 'oe'), ('ü', 'ue'), ('ß', 'ss')]:
+            word_converted = word_converted.replace(umlaut, replacement)
+        if word_converted != word and word_converted in domain_base:
+            score += 10
+        # Reverse: ASCII -> Umlaut (domain has 'ae', word has 'ä')
+        domain_unconverted = domain_base
+        for replacement, umlaut in [('ae', 'ä'), ('oe', 'ö'), ('ue', 'ü')]:
+            domain_unconverted = domain_unconverted.replace(replacement, umlaut)
+        if word in domain_unconverted and domain_unconverted != domain_base:
+            score += 10
+    return score
+
 
 def _safe_first_name(name: str) -> str:
     """Extract first name safely, return 'unknown' if empty."""
@@ -216,9 +280,11 @@ async def _enrich_lead_inner(
     #
     # 1. Job URL Domain (MOST RELIABLE - if job is on company website)
     # 2. LLM extracted domain (from job description text)
-    # 3. DuckDuckGo Search (FREE - real web search, best results)
-    # 4. Heuristic (FREE - generates domains from company name)
-    # 5. Google CSE (Last resort - uses API quota, 100 free/day)
+    # 3. Serper.dev Google SERP ($0.001/query - real Google results)
+    # 4. Google Knowledge Graph (FREE - 100K/day, official website URLs)
+    # 5. DuckDuckGo Search (FREE - web search fallback)
+    # 6. Heuristic (FREE - generates domains from company name)
+    # 7. Google CSE (Last resort - uses API quota, 100 free/day)
 
     # Build job context for smarter AI domain validation
     job_context_for_validation = ""
@@ -260,55 +326,88 @@ async def _enrich_lead_inner(
             if not company_info.website:
                 company_info.website = f"https://{company_info.domain}"
 
-    # Priority 3, 4 & 5: DuckDuckGo, Heuristic, then Google
+    # Priority 3-7: Serper → Knowledge Graph → DuckDuckGo → Heuristic → Google CSE
     if not company_info.domain and parsed.company_name:
-        # Strategy 3: DuckDuckGo search (FREE, best results, ~1-2s)
-        logger.info("No valid domain - trying DuckDuckGo search first...")
-        ddg_result = None
-        try:
-            ddg_result = await _duckduckgo_find_domain(
-                company_name=parsed.company_name,
-                job_title=payload.title or "",
-                job_context=job_context_for_validation,
-            )
-        except Exception as e:
-            logger.warning(f"DuckDuckGo search error: {e}")
-            operational_alerts["ddg_search_error"] = True
-            enrichment_path.append("ddg_error")
-        if ddg_result:
-            found_domain, website_url = ddg_result
-            company_info.domain = found_domain
-            company_info.website = website_url
-            enrichment_path.append("ddg_domain_found")
-            logger.info(f"✓ DuckDuckGo found domain: {found_domain}")
-        else:
-            # Strategy 4: Heuristic fallback (FREE, generates domains from company name)
-            logger.info("DuckDuckGo failed - trying heuristic domain search...")
-            heuristic_result = await _heuristic_find_domain(parsed.company_name, job_context=job_context_for_validation)
+        location = parsed.location or payload.location or ""
 
+        # Strategy 3: Serper.dev Google SERP (best results, $0.001/query)
+        if not company_info.domain and settings.serper_api_key:
+            logger.info("No valid domain - trying Serper.dev Google search...")
+            try:
+                serper_result = await _serper_find_domain(
+                    company_name=parsed.company_name,
+                    job_context=job_context_for_validation,
+                    location=location,
+                )
+                if serper_result:
+                    company_info.domain, company_info.website = serper_result
+                    enrichment_path.append("serper_domain_found")
+                    logger.info(f"✓ Serper found domain: {company_info.domain}")
+            except Exception as e:
+                logger.warning(f"Serper search error: {e}")
+                enrichment_path.append("serper_error")
+
+        # Strategy 4: Google Knowledge Graph (FREE, 100K/day)
+        if not company_info.domain and settings.google_api_key:
+            logger.info("Trying Google Knowledge Graph...")
+            try:
+                kg_result = await _knowledge_graph_find_domain(
+                    company_name=parsed.company_name,
+                    job_context=job_context_for_validation,
+                )
+                if kg_result:
+                    company_info.domain, company_info.website = kg_result
+                    enrichment_path.append("kg_domain_found")
+                    logger.info(f"✓ Knowledge Graph found domain: {company_info.domain}")
+            except Exception as e:
+                logger.warning(f"Knowledge Graph error: {e}")
+                enrichment_path.append("kg_error")
+
+        # Strategy 5: DuckDuckGo search (FREE, ~1-2s)
+        if not company_info.domain:
+            logger.info("Trying DuckDuckGo search...")
+            ddg_result = None
+            try:
+                ddg_result = await _duckduckgo_find_domain(
+                    company_name=parsed.company_name,
+                    job_title=payload.title or "",
+                    job_context=job_context_for_validation,
+                    location=location,
+                )
+            except Exception as e:
+                logger.warning(f"DuckDuckGo search error: {e}")
+                operational_alerts["ddg_search_error"] = True
+                enrichment_path.append("ddg_error")
+            if ddg_result:
+                company_info.domain, company_info.website = ddg_result
+                enrichment_path.append("ddg_domain_found")
+                logger.info(f"✓ DuckDuckGo found domain: {company_info.domain}")
+
+        # Strategy 6: Heuristic (FREE, generates domains from company name)
+        if not company_info.domain:
+            logger.info("Trying heuristic domain search...")
+            heuristic_result = await _heuristic_find_domain(parsed.company_name, job_context=job_context_for_validation)
             if heuristic_result:
-                found_domain, website_url = heuristic_result
-                company_info.domain = found_domain
-                company_info.website = website_url
+                company_info.domain, company_info.website = heuristic_result
                 enrichment_path.append("heuristic_domain_found")
-                logger.info(f"✓ Heuristic found domain: {found_domain}")
-            else:
-                # Strategy 5: Google CSE as last resort (uses API quota, 100 free/day)
-                logger.info("Heuristic failed - falling back to Google search...")
-                found_domain = await _google_find_domain(parsed.company_name, validate_with_ai=True)
-                if found_domain:
-                    # Check for subdomain patterns and try main domain too
-                    main_domain = _extract_main_domain(found_domain)
-                    if main_domain and main_domain != found_domain:
-                        logger.info(f"Found subdomain {found_domain}, also trying main domain {main_domain}")
-                        company_info.domain = main_domain
-                    else:
-                        company_info.domain = found_domain
-                    company_info.website = f"https://{company_info.domain}"
-                    enrichment_path.append("google_domain_found")
+                logger.info(f"✓ Heuristic found domain: {company_info.domain}")
+
+        # Strategy 7: Google CSE (last resort, 100 free/day)
+        if not company_info.domain:
+            logger.info("Falling back to Google CSE...")
+            found_domain = await _google_find_domain(parsed.company_name, validate_with_ai=True)
+            if found_domain:
+                main_domain = _extract_main_domain(found_domain)
+                if main_domain and main_domain != found_domain:
+                    logger.info(f"Found subdomain {found_domain}, using main domain {main_domain}")
+                    company_info.domain = main_domain
                 else:
-                    logger.warning(f"No valid domain found for '{parsed.company_name}'")
-                    enrichment_path.append("no_domain_found")
+                    company_info.domain = found_domain
+                company_info.website = f"https://{company_info.domain}"
+                enrichment_path.append("google_domain_found")
+            else:
+                logger.warning(f"No valid domain found for '{parsed.company_name}'")
+                enrichment_path.append("no_domain_found")
 
     # Ensure website URL is always set when we have a domain
     if company_info.domain and not company_info.website:
@@ -351,6 +450,7 @@ async def _enrich_lead_inner(
         enrichment_path.append("job_url_error")
     elif job_contact:
         enrichment_path.append("job_url_ai_extracted")
+        logger.info(f"Job URL extracted: name={job_contact.name}, email={job_contact.email}, phone={'yes' if job_contact.phone else 'no'}")
 
     if isinstance(impressum_result, Exception):
         logger.warning(f"Impressum scraping failed: {impressum_result}")
@@ -358,6 +458,10 @@ async def _enrich_lead_inner(
         enrichment_path.append("impressum_error")
     elif impressum_result:
         enrichment_path.append("impressum_ai_extracted")
+        exec_names = [e.name for e in (impressum_result.executives or []) if e.name]
+        logger.info(f"Impressum: {len(exec_names)} executives ({', '.join(exec_names[:3])}), "
+                    f"phones={len(impressum_result.phones)}, "
+                    f"address={'yes' if impressum_result.address else 'no'}")
 
     if isinstance(team_result, Exception):
         logger.warning(f"Team discovery failed: {team_result}")
@@ -378,7 +482,12 @@ async def _enrich_lead_inner(
                     if number and not company_info.phone:
                         company_info.phone = number
                         enrichment_path.append("impressum_company_phone")
+                        logger.info(f"Company phone from Impressum: {number[:8]}...")
                         break
+            if not company_info.phone:
+                logger.info(f"Impressum had {len(impressum_result.phones)} phone entries but none usable")
+        else:
+            logger.info("Impressum scraped successfully but no phone numbers found on page")
 
         # Company address from Impressum
         if impressum_result.address:
@@ -523,6 +632,37 @@ async def _enrich_lead_inner(
         for vc in validated_candidates[:3]:
             logger.info(f"  - {vc.name} (score: {vc.relevance_score}): {vc.validation_notes}")
 
+    # DM fallback: if all candidates failed validation but we had raw candidates
+    if not validated_candidates and all_candidates and parsed.company_name:
+        logger.info("All candidates failed validation - trying DM fallback...")
+        try:
+            dm_candidates = await linkedin_client.find_multiple_decision_makers(
+                company=parsed.company_name,
+                domain=company_info.domain,
+                job_category=payload.category,
+                max_candidates=3
+            )
+            if dm_candidates:
+                new_candidates = [
+                    {"name": dm["name"], "title": dm.get("title"),
+                     "linkedin_url": dm.get("linkedin_url"),
+                     "source": "linkedin_fallback", "priority": 40}
+                    for dm in dm_candidates if dm.get("name")
+                ]
+                validated_candidates = await validate_and_rank_candidates(
+                    candidates=new_candidates,
+                    company_name=parsed.company_name,
+                    company_domain=company_info.domain,
+                    job_category=payload.category
+                )
+                enrichment_path.append(f"dm_fallback_post_validation_{len(validated_candidates)}_found")
+                logger.info(f"DM fallback after validation found {len(validated_candidates)} candidates")
+                # Add to all_candidates for later lookup
+                all_candidates.extend(new_candidates)
+        except Exception as e:
+            logger.warning(f"DM fallback after validation failed: {e}")
+            enrichment_path.append("dm_fallback_post_validation_error")
+
     # Take top 3 candidates for verification (try up to 3 if earlier ones fail)
     MAX_CANDIDATES_TO_TRY = 3
     top_candidates = validated_candidates[:MAX_CANDIDATES_TO_TRY]
@@ -541,7 +681,7 @@ async def _enrich_lead_inner(
     #      ONLY keep if LinkedIn was verified → otherwise try next candidate!
     # 4. Collect up to 2 verified candidates for phone enrichment attempts
     #    (BetterContact/FullEnrich are free on no-result, so 2nd try costs nothing extra)
-    MAX_VERIFIED_CANDIDATES = 1
+    MAX_VERIFIED_CANDIDATES = 2  # FullEnrich is free on no-result, so 2nd try costs nothing extra
 
     TRUSTED_SOURCES = {"job_url", "llm_parse", "team_page", "impressum"}
 
@@ -788,21 +928,12 @@ async def _enrich_lead_inner(
             if linkedin_url:
                 logger.info(f"Trying enrichment for candidate {idx+1}: {candidate.name} (with verified LinkedIn)")
             else:
-                logger.info(f"Trying enrichment for candidate {idx+1}: {candidate.name} (no LinkedIn - BetterContact/FullEnrich only)")
+                logger.info(f"Trying enrichment for candidate {idx+1}: {candidate.name} (no LinkedIn - FullEnrich only)")
 
-            # Try BetterContact first (waterfall enrichment, best coverage)
-            phone_result, bc_emails = await _try_bettercontact(
-                first_name=first_name,
-                last_name=last_name,
-                company_name=parsed.company_name,
-                domain=company_info.domain,
-                linkedin_url=linkedin_url,
-                enrichment_path=enrichment_path
-            )
+            # BetterContact deaktiviert - nur FullEnrich + Kaspr für Phone
+            # phone_result, bc_emails = await _try_bettercontact(...)
 
-            collected_emails.extend(bc_emails)
-
-            # Try FullEnrich if no phone from BetterContact
+            # Try FullEnrich (free on no-result)
             if not phone_result:
                 phone_result, fe_emails = await _try_fullenrich(
                     first_name=first_name,
@@ -875,6 +1006,7 @@ async def _enrich_lead_inner(
         if research_result:
             company_intel = research_result
             enrichment_path.append("company_research")
+            logger.info(f"Company research: {len(research_result.summary)} chars, industry={research_result.industry}")
 
             # Transfer data
             if company_intel.industry and not company_info.industry:
@@ -1217,8 +1349,12 @@ async def _try_fullenrich(
             emails.extend(result.emails)
 
             if result.phones:
+                logger.info(f"FullEnrich returned {len(result.phones)} phones: {[p.number[:8]+'...' for p in result.phones]}")
                 # Filter for DACH phones
                 valid_phones = [p for p in result.phones if _is_valid_dach_phone(p.number)]
+                filtered = [p for p in result.phones if not _is_valid_dach_phone(p.number)]
+                for p in filtered:
+                    logger.info(f"FullEnrich phone filtered (non-DACH): {p.number[:8]}...")
 
                 if valid_phones:
                     # Prefer mobile
@@ -1288,7 +1424,11 @@ async def _try_kaspr(
             emails.extend(result.emails)
 
             if result.phones:
+                logger.info(f"Kaspr returned {len(result.phones)} phones: {[p.number[:8]+'...' for p in result.phones]}")
                 valid_phones = [p for p in result.phones if _is_valid_dach_phone(p.number)]
+                filtered = [p for p in result.phones if not _is_valid_dach_phone(p.number)]
+                for p in filtered:
+                    logger.info(f"Kaspr phone filtered (non-DACH): {p.number[:8]}...")
 
                 if valid_phones:
                     mobile_phones = [p for p in valid_phones if p.type == PhoneType.MOBILE]
@@ -1400,11 +1540,13 @@ JOB_PORTAL_DOMAINS = {
     'experteer.de', 'adzuna.de', 'neuvoo.de', 'jooble.de',
     'stellenwerk.de', 'greenjobs.de', 'azubiyo.de',
     'ausbildung.de', 'praktikum.de', 'campusjäger.de',
-    # International
+    # International / ATS
     'workday.com', 'greenhouse.io', 'lever.co', 'recruitee.com',
     'personio.de', 'softgarden.de', 'recruitingapp.com',
     'icims.com', 'taleo.net', 'successfactors.com',
     'smartrecruiters.com', 'jobvite.com', 'workable.com',
+    'join.com', 'onlyfy.com', 'breezy.hr', 'bamboohr.com', 'ashbyhq.com',
+    'dvinci.de', 'coveto.de', 'd.vinci.de',
 }
 
 
@@ -1433,8 +1575,11 @@ def _extract_domain_from_job_url(job_url: Optional[str], company_name: str) -> O
             logger.debug(f"Job URL is from job portal: {domain}")
             return None
 
-        # Additional check: common job portal patterns
-        if any(pattern in domain for pattern in ['jobs.', 'karriere.', 'career.', 'recruiting.']):
+        # Additional check: common job portal patterns (subdomain = jobs.company.de)
+        if any(pattern in domain for pattern in [
+            'jobs.', 'karriere.', 'career.', 'recruiting.', 'bewerbung.',
+            'stellenangebote.', 'apply.', 'hire.', 'talent.'
+        ]):
             # Could be jobs.company.de - extract main domain
             parts = domain.split('.')
             if len(parts) >= 2:
@@ -1569,10 +1714,12 @@ async def _heuristic_find_domain(company_name: str, job_context: str = "") -> Op
                                 logger.info(f"Parked domain detected: {domain} - skipping")
                                 return (domain, False, "", "")
                             return (domain, True, content[:3000], scheme)
-                    except Exception:
+                    except Exception as e:
+                        logger.debug(f"Domain {domain} HTTP check failed: {e}")
                         continue
                 return (domain, False, "", "")
-        except Exception:
+        except Exception as e:
+            logger.debug(f"Domain {domain} HTTP check failed: {e}")
             return (domain, False, "", "")
 
     # Check first 15 candidates in parallel
@@ -1599,72 +1746,231 @@ async def _heuristic_find_domain(company_name: str, job_context: str = "") -> Op
     return None
 
 
+async def _serper_find_domain(
+    company_name: str,
+    job_context: str = "",
+    location: str = "",
+) -> Optional[tuple]:
+    """
+    Find company domain via Serper.dev Google SERP API.
+    Real Google search results for $0.001/query.
+
+    Returns: (domain, website_url) tuple or None
+    """
+    settings = get_settings()
+    if not settings.serper_api_key:
+        return None
+
+    query = f"{company_name} {location}".strip() if location else company_name
+    logger.info(f"Serper domain search for: {query}")
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.post(
+                "https://google.serper.dev/search",
+                headers={
+                    "X-API-KEY": settings.serper_api_key,
+                    "Content-Type": "application/json",
+                },
+                json={"q": query, "gl": "de", "hl": "de", "num": 10},
+            )
+            response.raise_for_status()
+            data = response.json()
+    except Exception as e:
+        logger.warning(f"Serper API call failed: {e}")
+        return None
+
+    # Extract candidate domains from organic results
+    candidate_domains = []  # (domain, snippet, website_url)
+    seen_domains = set()
+
+    for result in data.get("organic", []):
+        link = result.get("link", "")
+        snippet = result.get("snippet", "")
+        if not link:
+            continue
+
+        parsed_url = urlparse(link)
+        domain = parsed_url.netloc.lower().replace("www.", "")
+
+        if not domain or domain in seen_domains:
+            continue
+        if any(skip in domain for skip in SKIP_DOMAINS):
+            continue
+
+        seen_domains.add(domain)
+        website_url = f"{parsed_url.scheme}://{domain}"
+        candidate_domains.append((domain, snippet, website_url))
+
+    if not candidate_domains:
+        logger.info(f"Serper: no valid candidate domains for '{company_name}'")
+        return None
+
+    # Sort by relevance, take top 5
+    scored = [(d, s, u, _domain_relevance_score(d, company_name)) for d, s, u in candidate_domains]
+    scored.sort(key=lambda x: -x[3])
+
+    logger.info(f"Serper candidates for '{company_name}': {[(d, sc) for d, _, _, sc in scored[:5]]}")
+
+    # HTTP-check + parked-domain-check for top 5 candidates
+    async def _check_serper_domain(domain: str, website_url: str) -> tuple:
+        try:
+            async with httpx.AsyncClient(
+                timeout=7.0, follow_redirects=True, verify=False,
+                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+            ) as http_client:
+                for scheme in ["https", "http"]:
+                    try:
+                        resp = await http_client.get(
+                            f"{scheme}://{domain}",
+                            follow_redirects=True,
+                            headers={"Accept": "text/html"}
+                        )
+                        if resp.status_code < 400:
+                            content = resp.text[:5000] if resp.text else ""
+                            if _is_parked_domain(content, domain):
+                                logger.info(f"Serper: parked domain skipped: {domain}")
+                                return (domain, website_url, "", False)
+                            return (domain, f"{scheme}://{domain}", content[:3000], True)
+                    except Exception as e:
+                        logger.debug(f"Serper domain {domain} HTTP check failed: {e}")
+                        continue
+            return (domain, website_url, "", False)
+        except Exception as e:
+            logger.debug(f"Serper domain {domain} HTTP check failed: {e}")
+            return (domain, website_url, "", False)
+
+    top5 = scored[:5]
+    check_results = await asyncio.gather(*[_check_serper_domain(d, u) for d, _, u, _ in top5])
+
+    # AI-validate only reachable, non-parked domains
+    for domain, website_url, page_content, is_valid in check_results:
+        if not is_valid:
+            continue
+        if await _ai_validate_domain(
+            domain, company_name,
+            page_content=page_content,
+            job_context=job_context,
+        ):
+            logger.info(f"✓ Serper found valid domain: {domain} for '{company_name}'")
+            return (domain, website_url)
+
+    logger.info(f"Serper: no domain passed AI validation for '{company_name}'")
+    return None
+
+
+async def _knowledge_graph_find_domain(
+    company_name: str,
+    job_context: str = "",
+) -> Optional[tuple]:
+    """
+    Find company domain via Google Knowledge Graph API.
+    FREE tier: 100,000 queries/day using existing Google API key.
+
+    Returns: (domain, website_url) tuple or None
+    """
+    settings = get_settings()
+    if not settings.google_api_key:
+        return None
+
+    logger.info(f"Knowledge Graph search for: {company_name}")
+
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            response = await client.get(
+                "https://kgsearch.googleapis.com/v1/entities:search",
+                params={
+                    "query": company_name,
+                    "key": settings.google_api_key,
+                    "types": "Organization",
+                    "languages": "de",
+                    "limit": 5,
+                },
+            )
+            response.raise_for_status()
+            data = response.json()
+    except Exception as e:
+        logger.warning(f"Knowledge Graph API call failed: {e}")
+        return None
+
+    for item in data.get("itemListElement", []):
+        result_score = item.get("resultScore", 0)
+        if result_score < 100:
+            continue
+
+        result = item.get("result", {})
+        website = result.get("url")
+        if not website:
+            continue
+
+        # Parse domain from the official website URL
+        try:
+            parsed_url = urlparse(website)
+            domain = parsed_url.netloc.lower().replace("www.", "")
+        except Exception:
+            continue
+
+        if not domain:
+            continue
+
+        # Skip known non-company domains
+        if any(skip in domain for skip in SKIP_DOMAINS):
+            continue
+
+        logger.info(f"Knowledge Graph candidate: {domain} (score: {result_score})")
+
+        # Validate with AI
+        if await _ai_validate_domain(domain, company_name, job_context=job_context):
+            website_url = f"https://{domain}"
+            logger.info(f"✓ Knowledge Graph found valid domain: {domain} for '{company_name}'")
+            return (domain, website_url)
+
+    logger.info(f"Knowledge Graph: no valid domain for '{company_name}'")
+    return None
+
+
 async def _duckduckgo_find_domain(
     company_name: str,
     job_title: str = "",
     job_context: str = "",
+    location: str = "",
 ) -> Optional[tuple]:
     """
-    Find company domain via DuckDuckGo HTML search - FREE, no API key needed.
+    Find company domain via DuckDuckGo search - FREE, no API key needed.
 
-    Uses DuckDuckGo's HTML endpoint (no JS required) with httpx + BeautifulSoup.
-    No extra dependencies - both are already in requirements.
+    Uses ddgs library for better result quality than the old HTML endpoint
+    scraping approach. Runs sync DDGS in a thread to avoid blocking the event loop.
 
     Returns: (domain, website_url) tuple or None
-    Raises: Exception on HTTP/parsing errors (DDG broken/blocked)
+    Raises: Exception on search errors (DDG broken/rate-limited)
     """
-    from bs4 import BeautifulSoup
+    from ddgs import DDGS
 
-    query = f"{company_name}"
-    logger.info(f"DuckDuckGo domain search for: {company_name}")
+    query = f"{company_name} {location}".strip() if location else company_name
+    logger.info(f"DuckDuckGo domain search for: {query}")
 
-    async with httpx.AsyncClient(
-        timeout=10.0,
-        follow_redirects=True,
-        headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-    ) as client:
-        response = await client.post(
-            "https://html.duckduckgo.com/html/",
-            data={"q": query},
+    def _do_search():
+        return DDGS(verify=False).text(query, region="de-de", max_results=10)
+
+    try:
+        results = await asyncio.wait_for(
+            asyncio.to_thread(_do_search), timeout=10
         )
-
-    if response.status_code != 200:
-        raise RuntimeError(f"DuckDuckGo HTTP {response.status_code}")
-
-    soup = BeautifulSoup(response.text, "html.parser")
-    results = soup.select(".result")
+    except asyncio.TimeoutError:
+        raise RuntimeError("DuckDuckGo search timed out after 10s")
+    except Exception as e:
+        raise RuntimeError(f"DuckDuckGo search failed: {e}")
 
     if not results:
-        # No .result elements = likely rate-limited or HTML structure changed
-        raise RuntimeError("DuckDuckGo returned no .result elements - possibly rate-limited or HTML changed")
-
-    # Filter out job portals, social media, directories, etc.
-    skip_domains = {
-        'linkedin.com', 'xing.com', 'facebook.com', 'twitter.com',
-        'instagram.com', 'youtube.com', 'wikipedia.org', 'kununu.de',
-        'glassdoor.com', 'indeed.com', 'indeed.de', 'stepstone.de',
-        'stepstone.at', 'monster.de', 'karriere.at', 'jobs.ch',
-        'jobware.de', 'stellenanzeigen.de', 'gehalt.de', 'hokify.de',
-        'hokify.at', 'meinestadt.de', 'arbeitsagentur.de',
-        'dnb.com', 'creditreform.de', 'northdata.com', 'webvalid.de',
-        'opencorpdata.com', 'cylex.de', 'firmenwissen.de', 'unternehmensregister.de',
-        'northdata.de', 'wlw.de', 'kompany.de',
-        'handelsregister.de', 'bundesanzeiger.de',
-        'google.com', 'google.de',
-    }
+        raise RuntimeError("DuckDuckGo returned no results - possibly rate-limited")
 
     # Extract candidate domains with snippets and actual URLs
     candidate_domains = []  # (domain, snippet, website_url)
     seen_domains = set()
 
-    for result in results[:10]:
-        link = result.select_one(".result__a")
-        snippet_el = result.select_one(".result__snippet")
-        if not link:
-            continue
-
-        href = link.get("href", "")
-        snippet = snippet_el.get_text(strip=True) if snippet_el else ""
+    for result in results:
+        href = result.get("href", "")
+        snippet = result.get("body", "")
         if not href:
             continue
 
@@ -1673,7 +1979,7 @@ async def _duckduckgo_find_domain(
 
         if not domain or domain in seen_domains:
             continue
-        if any(skip in domain for skip in skip_domains):
+        if any(skip in domain for skip in SKIP_DOMAINS):
             continue
 
         seen_domains.add(domain)
@@ -1684,38 +1990,57 @@ async def _duckduckgo_find_domain(
         logger.info(f"DuckDuckGo: no valid candidate domains for '{company_name}'")
         return None
 
-    # Relevance scoring: domains containing company name parts rank higher
-    def domain_relevance_score(domain: str) -> int:
-        name_lower = company_name.lower()
-        for suffix in [' gmbh & co. kgaa', ' gmbh & co. kg', ' gmbh & co kg',
-                      ' partg mbb', ' partg', ' gmbh', ' ggmbh', ' ag', ' kgaa',
-                      ' kg', ' ohg', ' mbh', ' ug', ' gbr', ' eg', ' e.v.', ' co.', ' & co']:
-            name_lower = name_lower.replace(suffix, '')
-        name_words = [w for w in name_lower.split() if len(w) >= 3]
-        domain_base = domain.split('.')[0].lower()
-
-        score = 0
-        for word in name_words:
-            if word in domain_base:
-                score += 10
-            word_converted = word
-            for umlaut, replacement in [('ä', 'ae'), ('ö', 'oe'), ('ü', 'ue'), ('ß', 'ss')]:
-                word_converted = word_converted.replace(umlaut, replacement)
-            if word_converted != word and word_converted in domain_base:
-                score += 10
-        return score
-
     # Sort by relevance, take top 5
-    scored = [(d, s, u, domain_relevance_score(d)) for d, s, u in candidate_domains]
+    scored = [(d, s, u, _domain_relevance_score(d, company_name)) for d, s, u in candidate_domains]
     scored.sort(key=lambda x: -x[3])
 
     logger.info(f"DuckDuckGo candidates for '{company_name}': {[(d, sc) for d, _, _, sc in scored[:5]]}")
 
-    # AI-validate top 5, passing snippet as page_content + job_context
-    for domain, snippet, website_url, score in scored[:5]:
+    # HTTP-check + parked-domain-check for top 5 candidates (reuse heuristic pattern)
+    async def check_ddg_domain(domain: str, website_url: str) -> tuple[str, str, str, bool]:
+        """Check if DDG candidate domain is reachable and not parked.
+        Returns (domain, website_url, page_content, is_valid)."""
+        try:
+            async with httpx.AsyncClient(
+                timeout=7.0,
+                follow_redirects=True,
+                verify=False,
+                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+            ) as client:
+                for scheme in ["https", "http"]:
+                    try:
+                        response = await client.get(
+                            f"{scheme}://{domain}",
+                            follow_redirects=True,
+                            headers={"Accept": "text/html"}
+                        )
+                        if response.status_code < 400:
+                            content = response.text[:5000] if response.text else ""
+                            if _is_parked_domain(content, domain):
+                                logger.info(f"DuckDuckGo: parked domain skipped: {domain}")
+                                return (domain, website_url, "", False)
+                            return (domain, f"{scheme}://{domain}", content[:3000], True)
+                    except Exception as e:
+                        logger.debug(f"DuckDuckGo domain {domain} HTTP check failed: {e}")
+                        continue
+            logger.info(f"DuckDuckGo: domain not reachable: {domain}")
+            return (domain, website_url, "", False)
+        except Exception:
+            logger.info(f"DuckDuckGo: domain check failed: {domain}")
+            return (domain, website_url, "", False)
+
+    # Check top 5 candidates in parallel
+    top5 = scored[:5]
+    check_tasks = [check_ddg_domain(d, u) for d, _, u, _ in top5]
+    check_results = await asyncio.gather(*check_tasks)
+
+    # AI-validate only reachable, non-parked domains (with real page content)
+    for domain, website_url, page_content, is_valid in check_results:
+        if not is_valid:
+            continue
         if await _ai_validate_domain(
             domain, company_name,
-            page_content=snippet,
+            page_content=page_content,
             job_context=job_context,
         ):
             logger.info(f"✓ DuckDuckGo found valid domain: {domain} for '{company_name}'")
@@ -1907,13 +2232,6 @@ async def _google_find_domain(company_name: str, validate_with_ai: bool = True) 
             track_google("domain_search")  # Track Google API call
             data = response.json()
 
-            skip_domains = {
-                'linkedin.com', 'xing.com', 'facebook.com', 'twitter.com',
-                'instagram.com', 'youtube.com', 'wikipedia.org', 'kununu.de',
-                'glassdoor.com', 'indeed.com', 'stepstone.de', 'monster.de',
-                'karriere.at', 'jobs.ch', 'jobware.de', 'stellenanzeigen.de'
-            }
-
             # Collect ALL candidate domains first
             candidate_domains = []
             for item in data.get("items", []):
@@ -1921,7 +2239,7 @@ async def _google_find_domain(company_name: str, validate_with_ai: bool = True) 
                 if link:
                     parsed = urlparse(link)
                     domain = parsed.netloc.replace("www.", "")
-                    if not any(skip in domain for skip in skip_domains):
+                    if not any(skip in domain for skip in SKIP_DOMAINS):
                         if domain not in candidate_domains:
                             candidate_domains.append(domain)
 
@@ -1929,69 +2247,55 @@ async def _google_find_domain(company_name: str, validate_with_ai: bool = True) 
                 logger.warning(f"No candidate domains found for {company_name}")
                 return None
 
-            # Smart prioritization: domains containing company name parts should come first
-            def domain_relevance_score(domain: str) -> int:
-                """Higher score = more relevant. Domains with company name parts get priority."""
-                import unicodedata
-
-                # Normalize company name: remove GmbH/AG/etc, lowercase, handle umlauts
-                name_lower = company_name.lower()
-                for suffix in [' gmbh & co. kgaa', ' gmbh & co. kg', ' gmbh & co kg',
-                              ' partg mbb', ' partg', ' gmbh', ' ggmbh', ' ag', ' kgaa',
-                              ' kg', ' ohg', ' mbh', ' ug', ' gbr', ' eg', ' e.v.', ' co.', ' & co']:
-                    name_lower = name_lower.replace(suffix, '')
-
-                # Extract meaningful words (at least 3 chars)
-                name_words = [w for w in name_lower.split() if len(w) >= 3]
-
-                # Normalize domain
-                domain_base = domain.split('.')[0].lower()
-
-                # Also create umlaut-converted versions
-                umlaut_map = {'ä': 'ae', 'ö': 'oe', 'ü': 'ue', 'ß': 'ss', 'a': 'ae', 'o': 'oe', 'u': 'ue'}
-
-                score = 0
-                for word in name_words:
-                    # Check direct match
-                    if word in domain_base:
-                        score += 10
-                    # Check with umlaut conversion (ö -> oe, etc)
-                    word_converted = word
-                    for umlaut, replacement in [('ä', 'ae'), ('ö', 'oe'), ('ü', 'ue'), ('ß', 'ss')]:
-                        word_converted = word_converted.replace(umlaut, replacement)
-                    if word_converted != word and word_converted in domain_base:
-                        score += 10
-                    # Check reverse (domain has ae, word has ä)
-                    domain_unconverted = domain_base
-                    for umlaut, replacement in [('ae', 'ä'), ('oe', 'ö'), ('ue', 'ü')]:
-                        domain_unconverted = domain_unconverted.replace(replacement, umlaut)
-                    if word in domain_unconverted:
-                        score += 10
-
-                return score
-
-            # Sort by relevance (highest first), then keep original order as tiebreaker
-            candidate_domains_scored = [(d, domain_relevance_score(d)) for d in candidate_domains]
+            # Sort by relevance using shared scoring
+            candidate_domains_scored = [(d, _domain_relevance_score(d, company_name)) for d in candidate_domains]
             candidate_domains_scored.sort(key=lambda x: -x[1])
 
-            # Log the prioritization for debugging
-            logger.info(f"Domain candidates for '{company_name}': {[(d, s) for d, s in candidate_domains_scored[:5]]}")
+            logger.info(f"Google CSE candidates for '{company_name}': {[(d, s) for d, s in candidate_domains_scored[:5]]}")
 
-            # Take top 5 for AI validation
-            candidate_domains = [d for d, s in candidate_domains_scored[:5]]
+            # Take top 5 for HTTP check + AI validation
+            top5 = [d for d, s in candidate_domains_scored[:5]]
 
-            # If AI validation enabled, check each candidate
             if validate_with_ai:
-                for domain in candidate_domains:
-                    if await _ai_validate_domain(domain, company_name):
+                # HTTP-check + parked-domain-check (same pattern as DDG)
+                async def _check_cse_domain(domain: str) -> tuple:
+                    try:
+                        async with httpx.AsyncClient(
+                            timeout=7.0, follow_redirects=True, verify=False,
+                            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+                        ) as http_client:
+                            for scheme in ["https", "http"]:
+                                try:
+                                    resp = await http_client.get(
+                                        f"{scheme}://{domain}",
+                                        follow_redirects=True,
+                                        headers={"Accept": "text/html"}
+                                    )
+                                    if resp.status_code < 400:
+                                        content = resp.text[:5000] if resp.text else ""
+                                        if _is_parked_domain(content, domain):
+                                            return (domain, "", False)
+                                        return (domain, content[:3000], True)
+                                except Exception as e:
+                                    logger.debug(f"CSE domain {domain} HTTP check failed: {e}")
+                                    continue
+                        return (domain, "", False)
+                    except Exception as e:
+                        logger.debug(f"CSE domain {domain} HTTP check failed: {e}")
+                        return (domain, "", False)
+
+                check_results = await asyncio.gather(*[_check_cse_domain(d) for d in top5])
+
+                for domain, page_content, is_valid in check_results:
+                    if not is_valid:
+                        continue
+                    if await _ai_validate_domain(domain, company_name, page_content=page_content):
                         return domain
 
-                # No domain passed AI validation
-                logger.warning(f"No domain passed AI validation for {company_name} - candidates were: {candidate_domains}")
+                logger.warning(f"No domain passed validation for {company_name} - candidates: {top5}")
                 return None
             else:
-                # No AI validation - return first candidate
-                return candidate_domains[0]
+                return top5[0]
 
         except Exception as e:
             logger.warning(f"Google domain search failed: {e}")

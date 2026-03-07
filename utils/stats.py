@@ -260,7 +260,8 @@ def track_pipeline_result(result) -> None:
         if has_domain:
             stats["domain_found"] += 1
         # Domain source
-        for source in ["job_url_domain_found", "llm_domain_validated", "ddg_domain_found",
+        for source in ["job_url_domain_found", "llm_domain_validated", "serper_domain_found",
+                        "kg_domain_found", "ddg_domain_found",
                         "heuristic_domain_found", "google_domain_found"]:
             if source in path:
                 stats["domain_source"][source] = stats["domain_source"].get(source, 0) + 1
@@ -365,9 +366,10 @@ def get_pipeline_dashboard() -> str:
         "",
         "--- KUNDEN-ÜBERSICHT ---",
         f"  Website/Domain:        {domain}/{total} ({pct(domain)})",
-        f"  Firmentelefon:         {company_phone}/{total} ({pct(company_phone)})",
+        f"  Firmentelefon (Impr.): {company_phone}/{total} ({pct(company_phone)})",
         f"  Ansprechpartner:       {dm}/{total} ({pct(dm)})",
-        f"  Telefon Ansprechp.:    {phone}/{total} ({pct(phone)})",
+        f"  Telefon DM (API):      {phone}/{total} ({pct(phone)})",
+        f"  Tel. gesamt (Firma|DM): {company_phone + phone}/{total} ({pct(company_phone + phone)})",
         f"  Email Ansprechp.:      {email}/{total} ({pct(email)})",
         "",
         "--- DETAILS ---",
@@ -381,6 +383,8 @@ def get_pipeline_dashboard() -> str:
     source_labels = {
         "job_url_domain_found": "Job URL",
         "llm_domain_validated": "LLM Parser",
+        "serper_domain_found": "Serper.dev",
+        "kg_domain_found": "Knowledge Graph",
         "ddg_domain_found": "DuckDuckGo",
         "heuristic_domain_found": "Heuristic",
         "google_domain_found": "Google CSE",

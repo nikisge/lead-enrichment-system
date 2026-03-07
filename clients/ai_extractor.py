@@ -108,7 +108,7 @@ Falls keine echten Personen gefunden werden: []"""
     track_llm("contact_extract", tier="sonnet")  # Contact extraction uses Sonnet
 
     if not result or not isinstance(result, list):
-        logger.info(f"No contacts extracted from {page_type} page")
+        logger.warning(f"AI contact extraction returned invalid result for {page_type}: type={type(result)}")
         return []
 
     contacts = []

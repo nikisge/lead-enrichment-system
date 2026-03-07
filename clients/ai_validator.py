@@ -117,6 +117,7 @@ Antworte als JSON:
         )
 
     # Fallback: assume valid if AI call fails
+    logger.warning(f"Name validation LLM failed for '{name}', assuming valid")
     return ValidationResult(
         valid=True,
         reason="Keine KI-Validierung möglich, angenommen gültig",
@@ -371,7 +372,7 @@ Antworte als JSON-Array, sortiert nach relevance_score (höchste zuerst):
     track_llm("candidate_validate", tier="sonnet")  # Batch validation uses Sonnet
 
     if not result or not isinstance(result, list):
-        logger.warning("Candidate validation failed, returning unvalidated candidates")
+        logger.warning(f"Candidate validation LLM failed (type={type(result)}), returning {len(filtered_candidates)} unvalidated")
         # Fallback: return candidates without validation
         return [
             CandidateValidation(
