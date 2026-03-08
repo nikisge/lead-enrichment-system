@@ -183,6 +183,83 @@ def _is_valid_dach_phone(number: str) -> bool:
     return False
 
 
+def _extract_phone_from_html(html: str) -> Optional[str]:
+    """
+    Extract a DACH company phone number from HTML content.
+    Checks tel: links, Schema.org telephone, and common DACH phone patterns.
+    Returns the first valid DACH phone number found, or None.
+    """
+    if not html:
+        return None
+
+    # 1. tel: links (most reliable - explicit phone markup)
+    tel_pattern = re.compile(r'href=["\']tel:([+\d\s\-/().]+)["\']', re.IGNORECASE)
+    for match in tel_pattern.finditer(html):
+        number = match.group(1).strip()
+        if _is_valid_dach_phone(number):
+            return number
+
+    # 2. Schema.org "telephone" property (structured data)
+    schema_pattern = re.compile(r'"telephone"\s*:\s*"([^"]+)"', re.IGNORECASE)
+    for match in schema_pattern.finditer(html):
+        number = match.group(1).strip()
+        if _is_valid_dach_phone(number):
+            return number
+
+    # 3. Common DACH phone patterns in visible text
+    # Strip HTML tags first for cleaner matching
+    text = re.sub(r'<[^>]+>', ' ', html)
+    text = re.sub(r'\s+', ' ', text)
+
+    dach_patterns = [
+        # +49 (0) 123 456-789, +49 123 456789, etc.
+        re.compile(r'(\+49[\s\-/().\d]{8,20})'),
+        re.compile(r'(\+43[\s\-/().\d]{8,20})'),
+        re.compile(r'(\+41[\s\-/().\d]{8,20})'),
+        # 0049 format
+        re.compile(r'(0049[\s\-/().\d]{8,18})'),
+        re.compile(r'(0043[\s\-/().\d]{8,18})'),
+        re.compile(r'(0041[\s\-/().\d]{8,18})'),
+    ]
+
+    for pattern in dach_patterns:
+        for match in pattern.finditer(text):
+            number = match.group(1).strip()
+            # Clean up trailing punctuation
+            number = re.sub(r'[\s\-/().]+$', '', number)
+            if _is_valid_dach_phone(number):
+                return number
+
+    return None
+
+
+async def _extract_phone_from_homepage(domain: str) -> Optional[str]:
+    """
+    Fetch homepage HTML and extract company phone number.
+    Quick check with 5s timeout - runs before parallel scraping.
+    """
+    try:
+        async with httpx.AsyncClient(
+            timeout=5.0,
+            follow_redirects=True,
+            verify=False,
+            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+        ) as client:
+            response = await client.get(
+                f"https://{domain}",
+                follow_redirects=True,
+                headers={"Accept": "text/html"}
+            )
+            if response.status_code < 400 and response.text:
+                phone = _extract_phone_from_html(response.text[:20000])
+                if phone:
+                    logger.info(f"Homepage phone found for {domain}: {phone[:8]}...")
+                    return phone
+    except Exception as e:
+        logger.debug(f"Homepage phone extraction for {domain} failed: {e}")
+    return None
+
+
 PIPELINE_TIMEOUT_SECONDS = 480  # 8 min - waterfall services need time for all providers
 
 
@@ -302,31 +379,32 @@ async def _enrich_lead_inner(
         if url_domain:
             # Validate that this domain actually belongs to the company
             logger.info(f"Job URL domain found: {url_domain} - validating...")
-            if await _ai_validate_domain(url_domain, parsed.company_name, job_context=job_context_for_validation):
+            is_valid, ai_reason = await _ai_validate_domain(url_domain, parsed.company_name, job_context=job_context_for_validation)
+            if is_valid:
                 company_info.domain = url_domain
                 company_info.website = f"https://{url_domain}"
-                enrichment_path.append("job_url_domain_found")
+                enrichment_path.append(f"domain:job_url->{url_domain}")
                 logger.info(f"✓ Using domain from job URL: {url_domain}")
             else:
-                logger.warning(f"Job URL domain {url_domain} rejected by AI validation")
+                logger.warning(f"Job URL domain {url_domain} rejected by AI validation ({ai_reason})")
 
     # Priority 2: Validate LLM-extracted domain
-    if company_info.domain and parsed.company_name and "job_url_domain_found" not in enrichment_path:
+    if company_info.domain and parsed.company_name and not any(p.startswith("domain:job_url->") for p in enrichment_path):
         # LLM found a domain - validate it with AI
         logger.info(f"Validating LLM domain '{company_info.domain}' for '{parsed.company_name}'...")
-        is_valid = await _ai_validate_domain(company_info.domain, parsed.company_name, job_context=job_context_for_validation)
+        is_valid, ai_reason = await _ai_validate_domain(company_info.domain, parsed.company_name, job_context=job_context_for_validation)
 
         if not is_valid:
             # Domain doesn't match company - search for alternatives
             logger.warning(f"LLM domain '{company_info.domain}' rejected - searching alternatives...")
-            enrichment_path.append("llm_domain_rejected")
+            enrichment_path.append(f"domain:llm_rejected->{company_info.domain} (AI: {ai_reason})")
             company_info.domain = None  # Reset - will search below
         else:
-            enrichment_path.append("llm_domain_validated")
+            enrichment_path.append(f"domain:llm_validated->{company_info.domain}")
             if not company_info.website:
                 company_info.website = f"https://{company_info.domain}"
 
-    # Priority 3-7: Serper → Knowledge Graph → DuckDuckGo → Heuristic → Google CSE
+    # Priority 3-7: Serper → DuckDuckGo → Knowledge Graph → Google CSE → Heuristic
     if not company_info.domain and parsed.company_name:
         location = parsed.location or payload.location or ""
 
@@ -341,29 +419,13 @@ async def _enrich_lead_inner(
                 )
                 if serper_result:
                     company_info.domain, company_info.website = serper_result
-                    enrichment_path.append("serper_domain_found")
+                    enrichment_path.append(f"domain:serper->{company_info.domain}")
                     logger.info(f"✓ Serper found domain: {company_info.domain}")
             except Exception as e:
                 logger.warning(f"Serper search error: {e}")
                 enrichment_path.append("serper_error")
 
-        # Strategy 4: Google Knowledge Graph (FREE, 100K/day)
-        if not company_info.domain and settings.google_api_key:
-            logger.info("Trying Google Knowledge Graph...")
-            try:
-                kg_result = await _knowledge_graph_find_domain(
-                    company_name=parsed.company_name,
-                    job_context=job_context_for_validation,
-                )
-                if kg_result:
-                    company_info.domain, company_info.website = kg_result
-                    enrichment_path.append("kg_domain_found")
-                    logger.info(f"✓ Knowledge Graph found domain: {company_info.domain}")
-            except Exception as e:
-                logger.warning(f"Knowledge Graph error: {e}")
-                enrichment_path.append("kg_error")
-
-        # Strategy 5: DuckDuckGo search (FREE, ~1-2s)
+        # Strategy 4: DuckDuckGo search (FREE, ~1-2s)
         if not company_info.domain:
             logger.info("Trying DuckDuckGo search...")
             ddg_result = None
@@ -380,38 +442,71 @@ async def _enrich_lead_inner(
                 enrichment_path.append("ddg_error")
             if ddg_result:
                 company_info.domain, company_info.website = ddg_result
-                enrichment_path.append("ddg_domain_found")
+                enrichment_path.append(f"domain:ddg->{company_info.domain}")
                 logger.info(f"✓ DuckDuckGo found domain: {company_info.domain}")
 
-        # Strategy 6: Heuristic (FREE, generates domains from company name)
+        # Strategy 5: Google Knowledge Graph (FREE, 100K/day)
+        if not company_info.domain and settings.google_api_key:
+            logger.info("Trying Google Knowledge Graph...")
+            try:
+                kg_result = await _knowledge_graph_find_domain(
+                    company_name=parsed.company_name,
+                    job_context=job_context_for_validation,
+                )
+                if kg_result:
+                    company_info.domain, company_info.website = kg_result
+                    enrichment_path.append(f"domain:kg->{company_info.domain}")
+                    logger.info(f"✓ Knowledge Graph found domain: {company_info.domain}")
+            except Exception as e:
+                logger.warning(f"Knowledge Graph error: {e}")
+                enrichment_path.append("kg_error")
+
+        # Strategy 6: Google CSE (100 free/day)
+        if not company_info.domain:
+            logger.info("Falling back to Google CSE...")
+            found_domain = await _google_find_domain(parsed.company_name, validate_with_ai=True)
+            if found_domain:
+                company_info.domain = found_domain
+                company_info.website = f"https://{company_info.domain}"
+                enrichment_path.append(f"domain:google_cse->{company_info.domain}")
+
+        # Strategy 7: Heuristic (FREE, last resort - generates domains from company name)
         if not company_info.domain:
             logger.info("Trying heuristic domain search...")
             heuristic_result = await _heuristic_find_domain(parsed.company_name, job_context=job_context_for_validation)
             if heuristic_result:
                 company_info.domain, company_info.website = heuristic_result
-                enrichment_path.append("heuristic_domain_found")
+                enrichment_path.append(f"domain:heuristic->{company_info.domain}")
                 logger.info(f"✓ Heuristic found domain: {company_info.domain}")
 
-        # Strategy 7: Google CSE (last resort, 100 free/day)
         if not company_info.domain:
-            logger.info("Falling back to Google CSE...")
-            found_domain = await _google_find_domain(parsed.company_name, validate_with_ai=True)
-            if found_domain:
-                main_domain = _extract_main_domain(found_domain)
-                if main_domain and main_domain != found_domain:
-                    logger.info(f"Found subdomain {found_domain}, using main domain {main_domain}")
-                    company_info.domain = main_domain
-                else:
-                    company_info.domain = found_domain
-                company_info.website = f"https://{company_info.domain}"
-                enrichment_path.append("google_domain_found")
-            else:
-                logger.warning(f"No valid domain found for '{parsed.company_name}'")
-                enrichment_path.append("no_domain_found")
+            logger.warning(f"No valid domain found for '{parsed.company_name}'")
+            enrichment_path.append("domain:NONE_FOUND")
+
+    # Normalize: extract main domain from any subdomain result
+    if company_info.domain:
+        main_domain = _extract_main_domain(company_info.domain)
+        if main_domain and main_domain != company_info.domain:
+            enrichment_path.append(f"subdomain_extracted:{company_info.domain}->{main_domain}")
+            logger.info(f"Subdomain normalized: {company_info.domain} -> {main_domain}")
+            company_info.domain = main_domain
+            company_info.website = f"https://{main_domain}"
 
     # Ensure website URL is always set when we have a domain
     if company_info.domain and not company_info.website:
         company_info.website = f"https://{company_info.domain}"
+
+    # ========== HOMEPAGE PHONE EXTRACTION ==========
+    # Try to extract company phone from homepage before parallel scraping
+    if company_info.domain and not company_info.phone:
+        try:
+            homepage_phone = await _extract_phone_from_homepage(company_info.domain)
+            if homepage_phone:
+                company_info.phone = homepage_phone
+                enrichment_path.append(f"company_phone:homepage->{homepage_phone[:8]}...")
+                logger.info(f"Company phone from homepage: {homepage_phone[:8]}...")
+        except Exception as e:
+            logger.debug(f"Homepage phone extraction failed: {e}")
 
     # ========== PHASE 2: PARALLEL SCRAPING ==========
 
@@ -481,7 +576,7 @@ async def _enrich_lead_inner(
                     number = phone_data.get("number", "")
                     if number and not company_info.phone:
                         company_info.phone = number
-                        enrichment_path.append("impressum_company_phone")
+                        enrichment_path.append(f"company_phone:impressum->{number[:8]}...")
                         logger.info(f"Company phone from Impressum: {number[:8]}...")
                         break
             if not company_info.phone:
@@ -1499,7 +1594,7 @@ def _extract_main_domain(domain: str) -> Optional[str]:
 
     # Need at least 3 parts for a subdomain (e.g., sub.company.de)
     if len(parts) < 3:
-        return None  # Already a main domain
+        return domain  # Already a main domain
 
     # Extract TLD (last part) and check for country-code TLDs
     tld = parts[-1]
@@ -1737,7 +1832,8 @@ async def _heuristic_find_domain(company_name: str, job_context: str = "") -> Op
 
     # Step 4: Validate with AI (with page content + job context for smarter validation)
     for domain, snippet, scheme in existing_domains:
-        if await _ai_validate_domain(domain, company_name, page_content=snippet, job_context=job_context):
+        is_valid, ai_reason = await _ai_validate_domain(domain, company_name, page_content=snippet, job_context=job_context)
+        if is_valid:
             website_url = f"{scheme}://{domain}"
             logger.info(f"✓ Heuristic found valid domain: {domain} for '{company_name}'")
             return (domain, website_url)
@@ -1847,11 +1943,12 @@ async def _serper_find_domain(
     for domain, website_url, page_content, is_valid in check_results:
         if not is_valid:
             continue
-        if await _ai_validate_domain(
+        ai_valid, ai_reason = await _ai_validate_domain(
             domain, company_name,
             page_content=page_content,
             job_context=job_context,
-        ):
+        )
+        if ai_valid:
             logger.info(f"✓ Serper found valid domain: {domain} for '{company_name}'")
             return (domain, website_url)
 
@@ -1919,8 +2016,42 @@ async def _knowledge_graph_find_domain(
 
         logger.info(f"Knowledge Graph candidate: {domain} (score: {result_score})")
 
-        # Validate with AI
-        if await _ai_validate_domain(domain, company_name, job_context=job_context):
+        # HTTP reachability + parked domain check (same pattern as Serper/DDG)
+        page_content = ""
+        try:
+            async with httpx.AsyncClient(
+                timeout=7.0, follow_redirects=True, verify=False,
+                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+            ) as http_client:
+                for scheme in ["https", "http"]:
+                    try:
+                        resp = await http_client.get(
+                            f"{scheme}://{domain}",
+                            follow_redirects=True,
+                            headers={"Accept": "text/html"}
+                        )
+                        if resp.status_code < 400:
+                            content = resp.text[:5000] if resp.text else ""
+                            if _is_parked_domain(content, domain):
+                                logger.info(f"Knowledge Graph: parked domain skipped: {domain}")
+                                page_content = ""
+                                break
+                            page_content = content[:3000]
+                            break
+                    except Exception as e:
+                        logger.debug(f"KG domain {domain} HTTP check failed: {e}")
+                        continue
+        except Exception as e:
+            logger.debug(f"KG domain {domain} HTTP check error: {e}")
+
+        if not page_content:
+            # Domain unreachable or parked - skip
+            logger.info(f"Knowledge Graph: domain {domain} unreachable or parked - skipping")
+            continue
+
+        # Validate with AI (now with page content)
+        ai_valid, ai_reason = await _ai_validate_domain(domain, company_name, page_content=page_content, job_context=job_context)
+        if ai_valid:
             website_url = f"https://{domain}"
             logger.info(f"✓ Knowledge Graph found valid domain: {domain} for '{company_name}'")
             return (domain, website_url)
@@ -2038,11 +2169,12 @@ async def _duckduckgo_find_domain(
     for domain, website_url, page_content, is_valid in check_results:
         if not is_valid:
             continue
-        if await _ai_validate_domain(
+        ai_valid, ai_reason = await _ai_validate_domain(
             domain, company_name,
             page_content=page_content,
             job_context=job_context,
-        ):
+        )
+        if ai_valid:
             logger.info(f"✓ DuckDuckGo found valid domain: {domain} for '{company_name}'")
             return (domain, website_url)
 
@@ -2133,11 +2265,11 @@ def _is_parked_domain(html_content: str, domain: str = "") -> bool:
     return False
 
 
-async def _ai_validate_domain(domain: str, company_name: str, page_content: str = "", job_context: str = "") -> bool:
+async def _ai_validate_domain(domain: str, company_name: str, page_content: str = "", job_context: str = "") -> tuple[bool, str]:
     """
     Use AI to check if a domain belongs to the company.
     Includes page content snippet and job context for smarter validation.
-    Returns True if domain matches, False otherwise.
+    Returns (matches: bool, reason: str) tuple.
     """
     try:
         llm_client = get_llm_client()
@@ -2193,11 +2325,11 @@ Antworte NUR mit JSON:
         else:
             logger.warning(f"AI rejected domain: {domain} -> {company_name} ✗ ({reason})")
 
-        return matches
+        return (matches, reason)
 
     except Exception as e:
         logger.error(f"AI domain validation failed: {e} - rejecting domain for safety")
-        return False  # On error, reject - better no domain than wrong domain
+        return (False, f"validation_error: {e}")  # On error, reject - better no domain than wrong domain
 
 
 async def _google_find_domain(company_name: str, validate_with_ai: bool = True) -> Optional[str]:
@@ -2289,7 +2421,8 @@ async def _google_find_domain(company_name: str, validate_with_ai: bool = True) 
                 for domain, page_content, is_valid in check_results:
                     if not is_valid:
                         continue
-                    if await _ai_validate_domain(domain, company_name, page_content=page_content):
+                    ai_valid, ai_reason = await _ai_validate_domain(domain, company_name, page_content=page_content)
+                    if ai_valid:
                         return domain
 
                 logger.warning(f"No domain passed validation for {company_name} - candidates: {top5}")

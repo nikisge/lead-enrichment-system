@@ -259,12 +259,24 @@ def track_pipeline_result(result) -> None:
         has_domain = result.company.domain is not None
         if has_domain:
             stats["domain_found"] += 1
-        # Domain source
-        for source in ["job_url_domain_found", "llm_domain_validated", "serper_domain_found",
-                        "kg_domain_found", "ddg_domain_found",
-                        "heuristic_domain_found", "google_domain_found"]:
-            if source in path:
-                stats["domain_source"][source] = stats["domain_source"].get(source, 0) + 1
+        # Domain source (prefix-match for new enrichment_path format: "domain:source->...")
+        domain_source_prefixes = {
+            "domain:job_url->": "job_url",
+            "domain:llm_validated->": "llm_validated",
+            "domain:serper->": "serper",
+            "domain:ddg->": "ddg",
+            "domain:kg->": "kg",
+            "domain:google_cse->": "google_cse",
+            "domain:heuristic->": "heuristic",
+        }
+        for entry in path:
+            matched = False
+            for prefix, source_key in domain_source_prefixes.items():
+                if entry.startswith(prefix):
+                    stats["domain_source"][source_key] = stats["domain_source"].get(source_key, 0) + 1
+                    matched = True
+                    break
+            if matched:
                 break
 
         # Decision maker?
@@ -325,6 +337,7 @@ def track_pipeline_result(result) -> None:
             "emails_count": len(result.emails),
             "job_title": result.job_title,
             "success": result.success,
+            "enrichment_path": path,
         })
         if len(stats["recent_runs"]) > 100:
             stats["recent_runs"] = stats["recent_runs"][-100:]
@@ -381,13 +394,13 @@ def get_pipeline_dashboard() -> str:
         "--- DOMAIN SOURCE ---",
     ]
     source_labels = {
-        "job_url_domain_found": "Job URL",
-        "llm_domain_validated": "LLM Parser",
-        "serper_domain_found": "Serper.dev",
-        "kg_domain_found": "Knowledge Graph",
-        "ddg_domain_found": "DuckDuckGo",
-        "heuristic_domain_found": "Heuristic",
-        "google_domain_found": "Google CSE",
+        "job_url": "Job URL",
+        "llm_validated": "LLM Parser",
+        "serper": "Serper.dev",
+        "ddg": "DuckDuckGo",
+        "kg": "Knowledge Graph",
+        "google_cse": "Google CSE",
+        "heuristic": "Heuristic",
     }
     for key, label in source_labels.items():
         count = stats.get("domain_source", {}).get(key, 0)
