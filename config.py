@@ -19,6 +19,9 @@ class Settings(BaseSettings):
     google_api_key: str = ""
     google_cse_id: str = ""
 
+    # Optional: Serper.dev Google SERP API ($0.001/query)
+    serper_api_key: str = ""
+
     # Server
     host: str = "0.0.0.0"
     port: int = 8000
