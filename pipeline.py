@@ -145,7 +145,7 @@ def _is_valid_dach_phone(number: str) -> bool:
     Accepts: +49, +43, +41, 0049, 0043, 0041, 0xxx (German domestic)
 
     Validates:
-    - Min 10 digits (country + area + subscriber)
+    - Min 7 digits (short landlines like 089 21760)
     - Max 15 digits (international standard)
     - Filters service numbers (0800, 0900, 0180, 0137, 0700)
     """
@@ -155,8 +155,8 @@ def _is_valid_dach_phone(number: str) -> bool:
     cleaned = re.sub(r'[^\d+]', '', number)
     digits_only = re.sub(r'\D', '', cleaned)
 
-    # Length validation: min 10, max 15 digits
-    if len(digits_only) < 10 or len(digits_only) > 15:
+    # Length validation: min 7 (short landline like 089 21760), max 15 digits
+    if len(digits_only) < 7 or len(digits_only) > 15:
         logger.debug(f"Invalid phone length: {number} ({len(digits_only)} digits)")
         return False
 
@@ -2150,8 +2150,56 @@ Wenn KEINE passende Domain gefunden: {{"domain": null, "reason": "..."}}"""
                     continue
 
             if not domain_reachable:
-                logger.warning(f"Serper: AI-chosen domain {chosen_domain} not reachable — rejecting")
-                return None
+                logger.warning(f"Serper: AI-chosen domain {chosen_domain} not reachable — trying organic fallback")
+
+                # Step 3b: Fallback — try top organic domains individually
+                fallback_candidates = []
+                seen = {chosen_domain}
+                for result in organic_results:
+                    link = result.get("link", "")
+                    if not link:
+                        continue
+                    parsed_url = urlparse(link)
+                    fb_d = parsed_url.netloc.lower().replace("www.", "")
+                    if fb_d in seen or not fb_d:
+                        continue
+                    if any(skip in fb_d for skip in SKIP_DOMAINS):
+                        continue
+                    seen.add(fb_d)
+                    fallback_candidates.append(fb_d)
+
+                fallback_candidates.sort(key=lambda d: -_domain_relevance_score(d, company_name))
+
+                for fb_domain in fallback_candidates[:3]:
+                    try:
+                        for scheme in ["https", "http"]:
+                            try:
+                                resp = await http_client.get(
+                                    f"{scheme}://{fb_domain}",
+                                    follow_redirects=True,
+                                    headers={"Accept": "text/html"},
+                                )
+                                if resp.status_code < 400:
+                                    fb_content = resp.text[:5000] if resp.text else ""
+                                    if _is_parked_domain(fb_content, fb_domain):
+                                        break
+                                    ai_valid, _ = await _ai_validate_domain(fb_domain, company_name, fb_content[:3000], job_context)
+                                    if ai_valid:
+                                        chosen_domain = fb_domain
+                                        final_url = f"{scheme}://{fb_domain}"
+                                        domain_reachable = True
+                                        logger.info(f"✓ Serper fallback domain: {fb_domain}")
+                                        break
+                            except Exception:
+                                continue
+                        if domain_reachable:
+                            break
+                    except Exception:
+                        continue
+
+                if not domain_reachable:
+                    logger.warning(f"Serper: no reachable domain found for '{company_name}'")
+                    return None
     except Exception as e:
         logger.warning(f"Serper: HTTP check for {chosen_domain} failed: {e}")
         return None
