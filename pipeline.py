@@ -51,6 +51,7 @@ from clients.ai_validator import (
 )
 from clients.team_discovery import discover_team_contacts, TeamDiscoveryResult
 
+from utils.phone import normalize_phone_number
 from utils.stats import track_phone_attempt, track_pipeline_result
 from utils.cost_tracker import (
     start_cost_tracking, log_cost_summary,
@@ -408,10 +409,9 @@ async def _enrich_lead_inner(
     if not company_info.domain and parsed.company_name:
         location = parsed.location or payload.location or ""
 
-        # Strategy 3: Serper.dev Google SERP (best results, $0.001/query)
-        # Also extracts Knowledge Graph data (phone, address) from Google's Firmenkarte
+        # Strategy 3: Serper.dev (Places + Search parallel, AI selects best result, $0.002/query)
         if not company_info.domain and settings.serper_api_key:
-            logger.info("No valid domain - trying Serper.dev Google search...")
+            logger.info("No valid domain - trying Serper.dev (Places + Search)...")
             try:
                 serper_result = await _serper_find_domain(
                     company_name=parsed.company_name,
@@ -419,20 +419,21 @@ async def _enrich_lead_inner(
                     location=location,
                 )
                 if serper_result:
-                    company_info.domain, company_info.website, kg_phone, kg_address = serper_result
+                    company_info.domain, company_info.website, serper_phone, serper_address = serper_result
                     enrichment_path.append(f"domain:serper->{company_info.domain}")
                     logger.info(f"✓ Serper found domain: {company_info.domain}")
-                    # Apply Knowledge Graph phone + address
-                    if kg_phone and not company_info.phone and _is_valid_dach_phone(kg_phone):
-                        company_info.phone = kg_phone
-                        enrichment_path.append(f"company_phone:serper_kg->{kg_phone[:8]}...")
-                        logger.info(f"Company phone from Serper Knowledge Graph: {kg_phone[:8]}...")
-                    if kg_address and not company_info.address:
-                        company_info.address = kg_address
+                    # Apply phone from Serper (Places/KG/Snippet)
+                    if serper_phone and not company_info.phone and _is_valid_dach_phone(serper_phone):
+                        company_info.phone = serper_phone
+                        enrichment_path.append(f"company_phone:serper->{serper_phone[:8]}...")
+                        logger.info(f"Company phone from Serper: {serper_phone[:8]}...")
+                    # Apply address from Serper
+                    if serper_address and not company_info.address:
+                        company_info.address = serper_address
                         if not company_info.location:
-                            company_info.location = kg_address
-                        enrichment_path.append("company_address:serper_kg")
-                        logger.info(f"Company address from Serper KG: {kg_address[:40]}...")
+                            company_info.location = serper_address
+                        enrichment_path.append("company_address:serper")
+                        logger.info(f"Company address from Serper: {serper_address[:40]}...")
             except Exception as e:
                 logger.warning(f"Serper search error: {e}")
                 enrichment_path.append("serper_error")
@@ -1872,6 +1873,86 @@ async def _heuristic_find_domain(company_name: str, job_context: str = "") -> Op
     return None
 
 
+async def _serper_places_lookup(
+    company_name: str,
+    location: str = "",
+) -> Optional[dict]:
+    """
+    Serper Places API — Google Maps/Business data (Firmenkarte).
+    Returns dict with keys: domain, website, phone, address, title (or None).
+    Costs 1 Serper credit ($0.001).
+    """
+    settings = get_settings()
+    if not settings.serper_api_key:
+        return None
+
+    query = f"{company_name} {location}".strip() if location else company_name
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.post(
+                "https://google.serper.dev/places",
+                headers={
+                    "X-API-KEY": settings.serper_api_key,
+                    "Content-Type": "application/json",
+                },
+                json={"q": query, "gl": "de", "hl": "de", "location": "Germany"},
+            )
+            response.raise_for_status()
+            data = response.json()
+    except Exception as e:
+        logger.warning(f"Serper Places API call failed: {e}")
+        return None
+
+    places = data.get("places", [])
+    if not places:
+        logger.info(f"Serper Places: no results for '{company_name}'")
+        return None
+
+    # Take first result — Google Maps usually returns the best match first
+    place = places[0]
+    place_title = place.get("title", "")
+    place_website = place.get("website") or ""
+    place_phone = place.get("phoneNumber") or ""
+    place_address = place.get("address") or ""
+
+    logger.info(f"Serper Places for '{company_name}': title={place_title}, website={place_website}, phone={place_phone}")
+
+    # Simple title overlap check — at least one significant word must match
+    name_words = {w.lower() for w in company_name.split() if len(w) > 2}
+    title_words = {w.lower() for w in place_title.split() if len(w) > 2}
+    if name_words and not name_words & title_words:
+        logger.info(f"Serper Places: title mismatch — '{place_title}' vs '{company_name}', skipping")
+        return None
+
+    result = {"title": place_title}
+
+    # Extract domain from website URL
+    if place_website:
+        try:
+            parsed = urlparse(place_website if place_website.startswith("http") else f"https://{place_website}")
+            domain = parsed.netloc.lower().replace("www.", "")
+            if domain and not any(skip in domain for skip in SKIP_DOMAINS):
+                result["domain"] = domain
+                result["website"] = f"https://{domain}"
+        except Exception:
+            pass
+
+    # Normalize phone (local "089 xxx" → "+49 89 xxx")
+    if place_phone:
+        normalized = normalize_phone_number(place_phone, default_region="DE")
+        if normalized and _is_valid_dach_phone(normalized):
+            result["phone"] = normalized
+        elif _is_valid_dach_phone(place_phone):
+            # Fallback: keep original if it passes DACH validation
+            result["phone"] = place_phone
+
+    if place_address:
+        result["address"] = place_address
+
+    return result if ("domain" in result or "phone" in result) else None
+
+
 async def _serper_find_domain(
     company_name: str,
     job_context: str = "",
@@ -1879,11 +1960,11 @@ async def _serper_find_domain(
 ) -> Optional[tuple]:
     """
     Find company domain via Serper.dev Google SERP API.
-    Real Google search results for $0.001/query.
+    Runs Places + Search in parallel, then AI picks the best result.
 
-    Also extracts Knowledge Graph data (phone, address) when available.
+    Costs 2 Serper credits ($0.002) — 1 for search, 1 for places.
 
-    Returns: (domain, website_url, kg_phone, kg_address) tuple or None
+    Returns: (domain, website_url, phone, address) tuple or None
     """
     settings = get_settings()
     if not settings.serper_api_key:
@@ -1892,127 +1973,212 @@ async def _serper_find_domain(
     query = f"{company_name} {location}".strip() if location else company_name
     logger.info(f"Serper domain search for: {query}")
 
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            response = await client.post(
-                "https://google.serper.dev/search",
-                headers={
-                    "X-API-KEY": settings.serper_api_key,
-                    "Content-Type": "application/json",
-                },
-                json={"q": query, "gl": "de", "hl": "de", "num": 10},
-            )
-            response.raise_for_status()
-            data = response.json()
-    except Exception as e:
-        logger.warning(f"Serper API call failed: {e}")
+    # Step 1: Run Places + Search in parallel
+    async def _serper_search():
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                response = await client.post(
+                    "https://google.serper.dev/search",
+                    headers={
+                        "X-API-KEY": settings.serper_api_key,
+                        "Content-Type": "application/json",
+                    },
+                    json={"q": query, "gl": "de", "hl": "de", "num": 10},
+                )
+                response.raise_for_status()
+                return response.json()
+        except Exception as e:
+            logger.warning(f"Serper Search API call failed: {e}")
+            return None
+
+    search_data, places_data = await asyncio.gather(
+        _serper_search(),
+        _serper_places_lookup(company_name, location),
+    )
+
+    if not search_data and not places_data:
+        logger.warning(f"Serper: both Search and Places failed for '{company_name}'")
         return None
 
-    # Extract Knowledge Graph data (Google's Firmenkarte)
-    kg = data.get("knowledgeGraph", {})
+    # Extract Knowledge Graph data from search results (legacy fallback)
+    kg = (search_data or {}).get("knowledgeGraph", {})
     kg_phone = kg.get("phoneNumber") or kg.get("telephone") or None
     kg_address = kg.get("address") or None
     kg_website = kg.get("website") or None
-    kg_title = kg.get("title", "")
 
     if kg_phone or kg_address or kg_website:
-        logger.info(f"Serper Knowledge Graph for '{company_name}': website={kg_website}, phone={kg_phone}, address={kg_address}")
+        logger.info(f"Serper KG for '{company_name}': website={kg_website}, phone={kg_phone}, address={kg_address}")
 
-    # Try Knowledge Graph website first (most reliable - it's Google's verified info)
-    if kg_website:
-        try:
-            parsed_kg = urlparse(kg_website if kg_website.startswith("http") else f"https://{kg_website}")
-            kg_domain = parsed_kg.netloc.lower().replace("www.", "")
-            if kg_domain and not any(skip in kg_domain for skip in SKIP_DOMAINS):
-                ai_valid, ai_reason = await _ai_validate_domain(
-                    kg_domain, company_name, job_context=job_context,
-                )
-                if ai_valid:
-                    logger.info(f"✓ Serper KG found valid domain: {kg_domain} for '{company_name}'")
-                    return (kg_domain, f"https://{kg_domain}", kg_phone, kg_address)
-                else:
-                    logger.info(f"Serper KG domain {kg_domain} rejected by AI ({ai_reason})")
-        except Exception as e:
-            logger.debug(f"Serper KG website parsing failed: {e}")
+    # Step 2: Build AI input with ALL data sources
+    ai_sections = []
 
-    # Extract candidate domains from organic results
-    candidate_domains = []  # (domain, snippet, website_url)
-    seen_domains = set()
+    # Places data
+    if places_data:
+        places_line = f"  Title: {places_data.get('title', 'N/A')}"
+        if places_data.get('domain'):
+            places_line += f" | Website: {places_data['domain']}"
+        if places_data.get('phone'):
+            places_line += f" | Tel: {places_data['phone']}"
+        if places_data.get('address'):
+            places_line += f" | Adresse: {places_data['address']}"
+        ai_sections.append(f"Google Places (Firmenkarte):\n{places_line}")
 
-    for result in data.get("organic", []):
+    # Knowledge Graph data
+    if kg_website or kg_phone:
+        kg_line = f"  Website: {kg_website or 'N/A'}"
+        if kg_phone:
+            kg_line += f" | Tel: {kg_phone}"
+        if kg_address:
+            kg_line += f" | Adresse: {kg_address}"
+        ai_sections.append(f"Google Knowledge Graph:\n{kg_line}")
+
+    # Organic search results
+    organic_lines = []
+    organic_results = (search_data or {}).get("organic", [])
+    for i, result in enumerate(organic_results[:10], 1):
         link = result.get("link", "")
+        title = result.get("title", "")
         snippet = result.get("snippet", "")
         if not link:
             continue
-
         parsed_url = urlparse(link)
         domain = parsed_url.netloc.lower().replace("www.", "")
+        line = f"  {i}. \"{title}\" | {domain}"
+        if snippet:
+            line += f" | Snippet: \"{snippet[:150]}\""
+        organic_lines.append(line)
 
-        if not domain or domain in seen_domains:
-            continue
-        if any(skip in domain for skip in SKIP_DOMAINS):
-            continue
+    if organic_lines:
+        ai_sections.append("Google Suche Ergebnisse:\n" + "\n".join(organic_lines))
 
-        seen_domains.add(domain)
-        website_url = f"{parsed_url.scheme}://{domain}"
-        candidate_domains.append((domain, snippet, website_url))
-
-    if not candidate_domains:
-        logger.info(f"Serper: no valid candidate domains for '{company_name}'")
+    if not ai_sections:
+        logger.info(f"Serper: no data to analyze for '{company_name}'")
         return None
 
-    # Sort by relevance, take top 5
-    scored = [(d, s, u, _domain_relevance_score(d, company_name)) for d, s, u in candidate_domains]
-    scored.sort(key=lambda x: -x[3])
+    # Build AI prompt
+    job_hint = f" (Jobtitel/Kontext: {job_context[:200]})" if job_context else ""
+    all_data = "\n\n".join(ai_sections)
 
-    logger.info(f"Serper candidates for '{company_name}': {[(d, sc) for d, _, _, sc in scored[:5]]}")
+    ai_prompt = f"""Firma: "{company_name}"{job_hint}
 
-    # HTTP-check + parked-domain-check for top 5 candidates
-    async def _check_serper_domain(domain: str, website_url: str) -> tuple:
-        try:
-            async with httpx.AsyncClient(
-                timeout=7.0, follow_redirects=True, verify=False,
-                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-            ) as http_client:
-                for scheme in ["https", "http"]:
-                    try:
-                        resp = await http_client.get(
-                            f"{scheme}://{domain}",
-                            follow_redirects=True,
-                            headers={"Accept": "text/html"}
-                        )
-                        if resp.status_code < 400:
-                            content = resp.text[:5000] if resp.text else ""
-                            if _is_parked_domain(content, domain):
-                                logger.info(f"Serper: parked domain skipped: {domain}")
-                                return (domain, website_url, "", False)
-                            return (domain, f"{scheme}://{domain}", content[:3000], True)
-                    except Exception as e:
-                        logger.debug(f"Serper domain {domain} HTTP check failed: {e}")
-                        continue
-            return (domain, website_url, "", False)
-        except Exception as e:
-            logger.debug(f"Serper domain {domain} HTTP check failed: {e}")
-            return (domain, website_url, "", False)
+{all_data}
 
-    top5 = scored[:5]
-    check_results = await asyncio.gather(*[_check_serper_domain(d, u) for d, _, u, _ in top5])
+Welches Ergebnis ist die RICHTIGE Firmenwebseite für "{company_name}"?
+Beachte:
+- Die Domain muss zur EINSTELLENDEN FIRMA gehören, NICHT zu Jobportalen oder Personalvermittlern
+- Google Places (Firmenkarte) ist sehr zuverlässig — bevorzuge diese wenn der Firmenname passt
+- Snippets können die richtige Domain oder Telefonnummer enthalten (z.B. "Web: firma.de", "Telefon: +49...")
+- Extrahiere Telefonnummer und Adresse wenn verfügbar (aus Places, KG oder Snippets)
+- Bei ähnlichen Firmennamen: Achte auf EXAKTE Übereinstimmung (z.B. "089 Apartments" ≠ "089 Immobilienmanagement")
 
-    # AI-validate only reachable, non-parked domains
-    for domain, website_url, page_content, is_valid in check_results:
-        if not is_valid:
-            continue
-        ai_valid, ai_reason = await _ai_validate_domain(
-            domain, company_name,
-            page_content=page_content,
-            job_context=job_context,
+Antworte NUR mit JSON:
+{{"domain": "firma.de", "phone": "+49...", "address": "Straße, Stadt", "source": "places/kg/organic/snippet", "confidence": "high/medium/low", "reason": "kurze Begründung"}}
+
+Wenn KEINE passende Domain gefunden: {{"domain": null, "reason": "..."}}"""
+
+    try:
+        llm_client = get_llm_client()
+        response = await llm_client.call(
+            prompt=ai_prompt,
+            tier="balanced",  # Haiku 4.5 — fast + accurate for structured selection
+            max_tokens=200,
         )
-        if ai_valid:
-            logger.info(f"✓ Serper found valid domain: {domain} for '{company_name}'")
-            return (domain, website_url, kg_phone, kg_address)
 
-    logger.info(f"Serper: no domain passed AI validation for '{company_name}'")
-    return None
+        import json
+        content = response.content.strip()
+        if content.startswith("```"):
+            content = content.split("```")[1]
+            if content.startswith("json"):
+                content = content[4:]
+        content = content.strip()
+
+        ai_result = json.loads(content)
+        chosen_domain = ai_result.get("domain")
+        ai_phone = ai_result.get("phone") or None
+        ai_address = ai_result.get("address") or None
+        ai_source = ai_result.get("source", "unknown")
+        ai_confidence = ai_result.get("confidence", "unknown")
+        ai_reason = ai_result.get("reason", "")
+
+        logger.info(f"Serper AI chose domain={chosen_domain}, phone={ai_phone}, source={ai_source}, confidence={ai_confidence}, reason={ai_reason}")
+
+        if not chosen_domain:
+            logger.info(f"Serper AI: no suitable domain for '{company_name}' — {ai_reason}")
+            return None
+
+    except Exception as e:
+        logger.warning(f"Serper AI selection failed: {e} — falling back to places/KG domain")
+        # Fallback: use Places or KG domain without AI
+        chosen_domain = (places_data or {}).get("domain")
+        if not chosen_domain and kg_website:
+            try:
+                parsed_kg = urlparse(kg_website if kg_website.startswith("http") else f"https://{kg_website}")
+                chosen_domain = parsed_kg.netloc.lower().replace("www.", "")
+            except Exception:
+                pass
+        ai_phone = (places_data or {}).get("phone") or kg_phone
+        ai_address = (places_data or {}).get("address") or kg_address
+        ai_source = "fallback"
+
+        if not chosen_domain:
+            return None
+
+    # Step 3: HTTP-check + parked domain check on AI-chosen domain
+    try:
+        async with httpx.AsyncClient(
+            timeout=7.0, follow_redirects=True, verify=False,
+            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+        ) as http_client:
+            domain_reachable = False
+            final_url = f"https://{chosen_domain}"
+            for scheme in ["https", "http"]:
+                try:
+                    resp = await http_client.get(
+                        f"{scheme}://{chosen_domain}",
+                        follow_redirects=True,
+                        headers={"Accept": "text/html"}
+                    )
+                    if resp.status_code < 400:
+                        content = resp.text[:5000] if resp.text else ""
+                        if _is_parked_domain(content, chosen_domain):
+                            logger.info(f"Serper: AI-chosen domain {chosen_domain} is parked — rejecting")
+                            return None
+                        final_url = f"{scheme}://{chosen_domain}"
+                        domain_reachable = True
+                        break
+                except Exception:
+                    continue
+
+            if not domain_reachable:
+                logger.warning(f"Serper: AI-chosen domain {chosen_domain} not reachable — rejecting")
+                return None
+    except Exception as e:
+        logger.warning(f"Serper: HTTP check for {chosen_domain} failed: {e}")
+        return None
+
+    # Step 4: Validate phone if AI extracted one
+    final_phone = None
+    if ai_phone:
+        # Normalize phone number
+        normalized = normalize_phone_number(ai_phone, default_region="DE")
+        if normalized and _is_valid_dach_phone(normalized):
+            final_phone = normalized
+        elif _is_valid_dach_phone(ai_phone):
+            final_phone = ai_phone
+
+    # Fallback: use Places or KG phone if AI didn't find one
+    if not final_phone:
+        places_phone = (places_data or {}).get("phone")
+        if places_phone and _is_valid_dach_phone(places_phone):
+            final_phone = places_phone
+        elif kg_phone and _is_valid_dach_phone(kg_phone):
+            normalized = normalize_phone_number(kg_phone, default_region="DE")
+            final_phone = normalized or kg_phone
+
+    final_address = ai_address or (places_data or {}).get("address") or kg_address
+
+    logger.info(f"✓ Serper found domain: {chosen_domain} (source={ai_source}, phone={'yes' if final_phone else 'no'}, address={'yes' if final_address else 'no'})")
+    return (chosen_domain, final_url, final_phone, final_address)
 
 
 async def _knowledge_graph_find_domain(
