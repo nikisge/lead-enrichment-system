@@ -409,6 +409,7 @@ async def _enrich_lead_inner(
         location = parsed.location or payload.location or ""
 
         # Strategy 3: Serper.dev Google SERP (best results, $0.001/query)
+        # Also extracts Knowledge Graph data (phone, address) from Google's Firmenkarte
         if not company_info.domain and settings.serper_api_key:
             logger.info("No valid domain - trying Serper.dev Google search...")
             try:
@@ -418,9 +419,20 @@ async def _enrich_lead_inner(
                     location=location,
                 )
                 if serper_result:
-                    company_info.domain, company_info.website = serper_result
+                    company_info.domain, company_info.website, kg_phone, kg_address = serper_result
                     enrichment_path.append(f"domain:serper->{company_info.domain}")
                     logger.info(f"✓ Serper found domain: {company_info.domain}")
+                    # Apply Knowledge Graph phone + address
+                    if kg_phone and not company_info.phone and _is_valid_dach_phone(kg_phone):
+                        company_info.phone = kg_phone
+                        enrichment_path.append(f"company_phone:serper_kg->{kg_phone[:8]}...")
+                        logger.info(f"Company phone from Serper Knowledge Graph: {kg_phone[:8]}...")
+                    if kg_address and not company_info.address:
+                        company_info.address = kg_address
+                        if not company_info.location:
+                            company_info.location = kg_address
+                        enrichment_path.append("company_address:serper_kg")
+                        logger.info(f"Company address from Serper KG: {kg_address[:40]}...")
             except Exception as e:
                 logger.warning(f"Serper search error: {e}")
                 enrichment_path.append("serper_error")
@@ -1040,14 +1052,9 @@ async def _enrich_lead_inner(
                 )
                 collected_emails.extend(fe_emails)
 
-            # Try Kaspr ONLY for first candidate (costs per request!) and only with VERIFIED LinkedIn
-            if not phone_result and linkedin_url and candidate_data.get("linkedin_verified") and idx == 0:
-                phone_result, kaspr_emails = await _try_kaspr(
-                    linkedin_url=linkedin_url,
-                    name=candidate.name,
-                    enrichment_path=enrichment_path
-                )
-                collected_emails.extend(kaspr_emails)
+            # Kaspr deactivated (no credits remaining)
+            # if not phone_result and linkedin_url and candidate_data.get("linkedin_verified") and idx == 0:
+            #     phone_result, kaspr_emails = await _try_kaspr(...)
 
             if phone_result:
                 # Found phone - create decision maker with verification status
@@ -1607,15 +1614,38 @@ def _extract_main_domain(domain: str) -> Optional[str]:
         # Standard TLD - main domain is last 2 parts
         main_domain = '.'.join(parts[-2:])
 
-    # For DACH-focused system: if main domain ends in .org or .com,
-    # also try .de variant as it's often the actual company website
-    base_name = parts[-2]  # company name part
+    # Safety check: don't normalize if the resulting main domain is a
+    # large shared/government domain (e.g., bayern.de, bund.de, tum.de)
+    # These are too generic — the subdomain IS the actual organization
+    shared_domains = {
+        'bayern.de', 'bund.de', 'nrw.de', 'sachsen.de', 'hessen.de',
+        'hamburg.de', 'berlin.de', 'bremen.de', 'brandenburg.de',
+        'thueringen.de', 'niedersachsen.de', 'saarland.de',
+        'baden-wuerttemberg.de', 'bwl.de', 'sachsen-anhalt.de',
+        'schleswig-holstein.de', 'mecklenburg-vorpommern.de',
+        'rlp.de',  # Rheinland-Pfalz
+        'gv.at', 'admin.ch',  # Austrian/Swiss government
+    }
+    if main_domain in shared_domains:
+        logger.info(f"Subdomain normalization skipped: {domain} is under shared domain {main_domain}")
+        return domain
 
-    if tld in ('org', 'com', 'net'):
-        # Keep original TLD - don't assume .de for AT/CH companies
-        logger.info(f"Subdomain detected: {domain} -> using main domain {main_domain}")
-        return main_domain
+    # Only normalize known subdomain prefixes (careers, www, jobs, etc.)
+    # For deep subdomains (4+ parts like a.b.c.de), keep as-is unless prefix is known
+    known_subdomain_prefixes = {
+        'www', 'careers', 'career', 'jobs', 'job', 'karriere',
+        'recruiting', 'bewerbung', 'stellenangebote', 'apply',
+        'hire', 'talent', 'shop', 'store', 'portal', 'app',
+        'de', 'en', 'fr', 'it',  # language subdomains
+        'professional', 'corporate', 'info', 'web',
+    }
+    subdomain_prefix = parts[0]
+    if len(parts) > 3 and subdomain_prefix not in known_subdomain_prefixes:
+        # Deep subdomain with unknown prefix — likely an organizational subdomain, keep it
+        logger.info(f"Subdomain normalization skipped: {domain} has deep structure (prefix '{subdomain_prefix}' unknown)")
+        return domain
 
+    logger.info(f"Subdomain detected: {domain} -> using main domain {main_domain}")
     return main_domain
 
 
@@ -1851,7 +1881,9 @@ async def _serper_find_domain(
     Find company domain via Serper.dev Google SERP API.
     Real Google search results for $0.001/query.
 
-    Returns: (domain, website_url) tuple or None
+    Also extracts Knowledge Graph data (phone, address) when available.
+
+    Returns: (domain, website_url, kg_phone, kg_address) tuple or None
     """
     settings = get_settings()
     if not settings.serper_api_key:
@@ -1875,6 +1907,33 @@ async def _serper_find_domain(
     except Exception as e:
         logger.warning(f"Serper API call failed: {e}")
         return None
+
+    # Extract Knowledge Graph data (Google's Firmenkarte)
+    kg = data.get("knowledgeGraph", {})
+    kg_phone = kg.get("phoneNumber") or kg.get("telephone") or None
+    kg_address = kg.get("address") or None
+    kg_website = kg.get("website") or None
+    kg_title = kg.get("title", "")
+
+    if kg_phone or kg_address or kg_website:
+        logger.info(f"Serper Knowledge Graph for '{company_name}': website={kg_website}, phone={kg_phone}, address={kg_address}")
+
+    # Try Knowledge Graph website first (most reliable - it's Google's verified info)
+    if kg_website:
+        try:
+            parsed_kg = urlparse(kg_website if kg_website.startswith("http") else f"https://{kg_website}")
+            kg_domain = parsed_kg.netloc.lower().replace("www.", "")
+            if kg_domain and not any(skip in kg_domain for skip in SKIP_DOMAINS):
+                ai_valid, ai_reason = await _ai_validate_domain(
+                    kg_domain, company_name, job_context=job_context,
+                )
+                if ai_valid:
+                    logger.info(f"✓ Serper KG found valid domain: {kg_domain} for '{company_name}'")
+                    return (kg_domain, f"https://{kg_domain}", kg_phone, kg_address)
+                else:
+                    logger.info(f"Serper KG domain {kg_domain} rejected by AI ({ai_reason})")
+        except Exception as e:
+            logger.debug(f"Serper KG website parsing failed: {e}")
 
     # Extract candidate domains from organic results
     candidate_domains = []  # (domain, snippet, website_url)
@@ -1950,7 +2009,7 @@ async def _serper_find_domain(
         )
         if ai_valid:
             logger.info(f"✓ Serper found valid domain: {domain} for '{company_name}'")
-            return (domain, website_url)
+            return (domain, website_url, kg_phone, kg_address)
 
     logger.info(f"Serper: no domain passed AI validation for '{company_name}'")
     return None
