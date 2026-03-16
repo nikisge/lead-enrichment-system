@@ -540,14 +540,22 @@ async def _enrich_lead_inner(
     team_discovery_task = discover_team_contacts(
         company_name=parsed.company_name,
         domain=company_info.domain,
-        job_category=payload.category
+        job_category=payload.category,
+        target_titles=parsed.target_titles
+    )
+
+    # Proactive Serper person search (parallel, $0.001/query)
+    serper_person_task = _serper_find_persons(
+        company_name=parsed.company_name,
+        target_titles=parsed.target_titles,
     )
 
     # Execute in parallel
-    job_contact, impressum_result, team_result = await asyncio.gather(
+    job_contact, impressum_result, team_result, serper_persons = await asyncio.gather(
         job_contact_task,
         impressum_task,
         team_discovery_task,
+        serper_person_task,
         return_exceptions=True
     )
 
@@ -579,6 +587,13 @@ async def _enrich_lead_inner(
         enrichment_path.append(f"team_discovery_{len(team_result.contacts)}_contacts")
         if team_result.fallback_used:
             enrichment_path.append("team_fallback_linkedin")
+
+    if isinstance(serper_persons, Exception):
+        logger.warning(f"Serper person search failed: {serper_persons}")
+        serper_persons = []
+    elif serper_persons:
+        enrichment_path.append(f"serper_person_{len(serper_persons)}_found")
+        logger.info(f"Serper person search: {len(serper_persons)} candidates found")
 
     # Process Impressum data
     if impressum_result:
@@ -673,6 +688,14 @@ async def _enrich_lead_inner(
 
         logger.info(f"Team contacts: {len(team_result.contacts)} (source: {team_source})")
 
+    # Priority 3.5: Serper person search results (untrusted, needs Apify verification)
+    if serper_persons and isinstance(serper_persons, list):
+        for sp in serper_persons:
+            if sp.get("name") and not any(_normalize_name_for_dedup(c.get("name", "")) == _normalize_name_for_dedup(sp["name"]) for c in all_candidates):
+                all_candidates.append(sp)
+        if serper_persons:
+            logger.info(f"Serper person candidates: {len(serper_persons)}")
+
     # Priority 4: Executives from Impressum
     if impressum_result and impressum_result.executives:
         for exec_contact in impressum_result.executives:
@@ -686,17 +709,18 @@ async def _enrich_lead_inner(
 
         logger.info(f"Impressum executives: {len(impressum_result.executives)}")
 
-    # Priority 5: Google Decision-Maker Fallback (when no candidates found)
-    # Uses Google to search LinkedIn for HR/Exec at this company
+    # Priority 5: Serper Decision-Maker Fallback (when no candidates found)
+    # Uses Serper.dev to search LinkedIn for executives at this company
     # ALL results MUST be verified via Apify later (untrusted source)
     if not all_candidates and parsed.company_name:
-        logger.info("No candidates found - trying Google decision-maker search as fallback...")
+        logger.info("No candidates found - trying Serper decision-maker search as fallback...")
         try:
             dm_candidates = await linkedin_client.find_multiple_decision_makers(
                 company=parsed.company_name,
                 domain=company_info.domain,
                 job_category=payload.category,
-                max_candidates=3
+                max_candidates=3,
+                target_titles=parsed.target_titles
             )
             for dm in dm_candidates:
                 if dm.get("name") and not any(_normalize_name_for_dedup(c.get("name", "")) == _normalize_name_for_dedup(dm["name"]) for c in all_candidates):
@@ -729,7 +753,8 @@ async def _enrich_lead_inner(
             candidates=all_candidates,
             company_name=parsed.company_name,
             company_domain=company_info.domain,
-            job_category=payload.category
+            job_category=payload.category,
+            target_titles=parsed.target_titles
         )
         # Note: Tracking happens inside validate_and_rank_candidates (uses Sonnet)
 
@@ -748,7 +773,8 @@ async def _enrich_lead_inner(
                 company=parsed.company_name,
                 domain=company_info.domain,
                 job_category=payload.category,
-                max_candidates=3
+                max_candidates=3,
+                target_titles=parsed.target_titles
             )
             if dm_candidates:
                 new_candidates = [
@@ -761,7 +787,8 @@ async def _enrich_lead_inner(
                     candidates=new_candidates,
                     company_name=parsed.company_name,
                     company_domain=company_info.domain,
-                    job_category=payload.category
+                    job_category=payload.category,
+                    target_titles=parsed.target_titles
                 )
                 enrichment_path.append(f"dm_fallback_post_validation_{len(validated_candidates)}_found")
                 logger.info(f"DM fallback after validation found {len(validated_candidates)} candidates")
@@ -985,6 +1012,9 @@ async def _enrich_lead_inner(
     phone_result: Optional[PhoneResult] = None
     decision_maker: Optional[DecisionMaker] = None
 
+    # Collect all enrichment results: (candidate, candidate_data, phone_result)
+    enrichment_results: List[tuple] = []
+
     # First: Check if any candidate already has a phone from input
     for candidate in top_candidates:
         candidate_data = next(
@@ -995,32 +1025,22 @@ async def _enrich_lead_inner(
 
         if input_phone and _is_valid_dach_phone(input_phone):
             logger.info(f"Using phone from input: {input_phone}")
-            phone_result = PhoneResult(
+            input_phone_result = PhoneResult(
                 number=input_phone,
                 type=PhoneType.UNKNOWN,
-                source=PhoneSource.COMPANY_MAIN,  # From job posting
+                source=PhoneSource.COMPANY_MAIN,
                 context_note="Direkt aus Stellenanzeige - wahrscheinlich geschäftlich"
             )
-            names = candidate.name.split() if candidate.name else []
-            # Only include LinkedIn URL if verified - unverified URLs are worthless
-            verified_linkedin = candidate_data.get("linkedin_url") if candidate_data.get("linkedin_verified") else None
-            decision_maker = DecisionMaker(
-                name=candidate.name,
-                first_name=names[0] if names else "",
-                last_name=" ".join(names[1:]) if len(names) > 1 else "",
-                title=candidate_data.get("title"),
-                linkedin_url=verified_linkedin,
-                email=candidate.email or candidate_data.get("email"),
-                verified_current=candidate_data.get("verified_current", False),
-                verification_note=candidate_data.get("verification_note")
-            )
+            enrichment_results.append((candidate, candidate_data, input_phone_result))
             enrichment_path.append("phone_from_input")
             break
 
     # If no phone from input, try paid APIs
-    if not phone_result and not skip_paid_apis and top_candidates:
+    if not enrichment_results and not skip_paid_apis and top_candidates:
         logger.info("Starting phone enrichment via APIs...")
 
+        # Try phone enrichment sequentially - stop on first success (FullEnrich charges on hit)
+        phone_found = False
         for idx, candidate in enumerate(top_candidates):
             candidate_data = next(
                 (c for c in all_candidates if _normalize_name_for_dedup(c.get("name", "")) == _normalize_name_for_dedup(candidate.name or "")),
@@ -1038,45 +1058,79 @@ async def _enrich_lead_inner(
             else:
                 logger.info(f"Trying enrichment for candidate {idx+1}: {candidate.name} (no LinkedIn - FullEnrich only)")
 
-            # BetterContact deaktiviert - nur FullEnrich + Kaspr für Phone
-            # phone_result, bc_emails = await _try_bettercontact(...)
+            # Try FullEnrich (free on no-result, charges on success)
+            candidate_phone, fe_emails = await _try_fullenrich(
+                first_name=first_name,
+                last_name=last_name,
+                company_name=parsed.company_name,
+                domain=company_info.domain,
+                linkedin_url=linkedin_url,
+                enrichment_path=enrichment_path
+            )
+            collected_emails.extend(fe_emails)
 
-            # Try FullEnrich (free on no-result)
-            if not phone_result:
-                phone_result, fe_emails = await _try_fullenrich(
-                    first_name=first_name,
-                    last_name=last_name,
-                    company_name=parsed.company_name,
-                    domain=company_info.domain,
-                    linkedin_url=linkedin_url,
-                    enrichment_path=enrichment_path
-                )
-                collected_emails.extend(fe_emails)
+            enrichment_results.append((candidate, candidate_data, candidate_phone))
 
-            # Kaspr deactivated (no credits remaining)
-            # if not phone_result and linkedin_url and candidate_data.get("linkedin_verified") and idx == 0:
-            #     phone_result, kaspr_emails = await _try_kaspr(...)
-
-            if phone_result:
-                # Found phone - create decision maker with verification status
-                # Only include LinkedIn URL if verified - unverified URLs are worthless
-                verified_linkedin = linkedin_url if candidate_data.get("linkedin_verified") else None
-                decision_maker = DecisionMaker(
-                    name=candidate.name,
-                    first_name=first_name,
-                    last_name=last_name,
-                    title=candidate_data.get("title"),
-                    linkedin_url=verified_linkedin,
-                    email=candidate.email or candidate_data.get("email"),
-                    verified_current=candidate_data.get("verified_current", False),
-                    verification_note=candidate_data.get("verification_note")
-                )
+            if candidate_phone:
                 enrichment_path.append(f"phone_found_candidate_{idx+1}")
-                logger.info(f"Phone found via {phone_result.source.value}")
-                break
+                logger.info(f"Phone found for {candidate.name} via {candidate_phone.source.value}")
+                phone_found = True
+                break  # Stop - FullEnrich charges per successful result
 
-    # Fallback: Use best candidate even without phone
-    if not decision_maker and top_candidates:
+        # If no phone found, still collect remaining candidates for relevance-based selection
+        if not phone_found:
+            for candidate in top_candidates:
+                if not any(_normalize_name_for_dedup(c.name) == _normalize_name_for_dedup(candidate.name or "") for c, _, _ in enrichment_results):
+                    candidate_data = next(
+                        (c for c in all_candidates if _normalize_name_for_dedup(c.get("name", "")) == _normalize_name_for_dedup(candidate.name or "")),
+                        {}
+                    )
+                    enrichment_results.append((candidate, candidate_data, None))
+
+    # ===== RELEVANCE-BASED SELECTION =====
+    # Score: relevance_score (AI) + phone bonus + title match bonus
+    # A department head (100) without phone > CEO (60) with phone (90)
+    if enrichment_results:
+        def _selection_score(result_tuple):
+            cand, cand_data, phone = result_tuple
+            score = cand.relevance_score  # 0-100 from AI ranking
+            if phone:
+                score += 30  # Phone bonus
+            if parsed.target_titles and _is_department_match(cand_data.get("title"), parsed.target_titles):
+                score += 20  # Department match bonus
+            return score
+
+        enrichment_results.sort(key=_selection_score, reverse=True)
+        best_candidate, best_data, best_phone = enrichment_results[0]
+
+        phone_result = best_phone
+
+        names = (best_candidate.name or "").split()
+        verified_linkedin = best_data.get("linkedin_url") if best_data.get("linkedin_verified") else None
+        dept_match = _is_department_match(best_data.get("title"), parsed.target_titles) if parsed.target_titles else None
+        match_reason = _build_match_reason(best_data, parsed.target_titles or [], payload.category)
+
+        decision_maker = DecisionMaker(
+            name=best_candidate.name,
+            first_name=names[0] if names else "",
+            last_name=" ".join(names[1:]) if len(names) > 1 else "",
+            title=best_data.get("title"),
+            linkedin_url=verified_linkedin,
+            email=best_candidate.email or best_data.get("email"),
+            verified_current=best_data.get("verified_current", False),
+            verification_note=best_data.get("verification_note"),
+            match_reason=match_reason,
+            department_match=dept_match
+        )
+
+        if best_phone:
+            enrichment_path.append(f"selected_with_phone_{_safe_first_name(best_candidate.name)}")
+        else:
+            enrichment_path.append(f"selected_no_phone_{_safe_first_name(best_candidate.name)}")
+        logger.info(f"Selected: {best_candidate.name} (score={_selection_score(enrichment_results[0])}, phone={'yes' if best_phone else 'no'}, match={match_reason})")
+
+    # Fallback: Use best validated candidate even without enrichment attempt
+    elif top_candidates:
         best = top_candidates[0]
         candidate_data = next(
             (c for c in all_candidates if _normalize_name_for_dedup(c.get("name", "")) == _normalize_name_for_dedup(best.name or "")),
@@ -1084,8 +1138,10 @@ async def _enrich_lead_inner(
         )
 
         names = best.name.split() if best.name else []
-        # Only include LinkedIn URL if verified - unverified URLs are worthless
         verified_linkedin = candidate_data.get("linkedin_url") if candidate_data.get("linkedin_verified") else None
+        dept_match = _is_department_match(candidate_data.get("title"), parsed.target_titles) if parsed.target_titles else None
+        match_reason = _build_match_reason(candidate_data, parsed.target_titles or [], payload.category)
+
         decision_maker = DecisionMaker(
             name=best.name,
             first_name=names[0] if names else "",
@@ -1094,7 +1150,9 @@ async def _enrich_lead_inner(
             linkedin_url=verified_linkedin,
             email=best.email or candidate_data.get("email"),
             verified_current=candidate_data.get("verified_current", False),
-            verification_note=candidate_data.get("verification_note")
+            verification_note=candidate_data.get("verification_note"),
+            match_reason=match_reason,
+            department_match=dept_match
         )
         enrichment_path.append("using_best_candidate_no_phone")
         logger.info(f"Using best candidate without phone: {best.name}")
@@ -1255,6 +1313,133 @@ async def enrich_lead_test_mode(payload: WebhookPayload) -> EnrichmentResult:
 # ========== HELPER FUNCTIONS ==========
 
 
+def _build_match_reason(candidate_data: Dict[str, Any], target_titles: List[str], job_category: Optional[str]) -> str:
+    """Build human-readable match reason for the decision maker.
+    e.g. 'IT-Leiter - passend zur IT-Stelle' or 'Geschäftsführung (Impressum)'"""
+    title = candidate_data.get("title", "")
+    source = candidate_data.get("source", "unknown")
+
+    if title and target_titles and _is_department_match(title, target_titles):
+        category_label = f" zur {job_category}-Stelle" if job_category else ""
+        return f"{title} - passend{category_label}"
+
+    source_labels = {
+        "job_url": "aus Stellenanzeige",
+        "llm_parse": "aus Stellenanzeige",
+        "team_page": "von Team-Seite",
+        "impressum": "aus Impressum",
+        "serper_search": "via Personensuche",
+        "linkedin_fallback": "via LinkedIn-Suche",
+    }
+    source_label = source_labels.get(source, source)
+
+    if title:
+        return f"{title} ({source_label})"
+    return f"Kontakt {source_label}"
+
+
+def _is_department_match(contact_title: Optional[str], target_titles: List[str]) -> bool:
+    """Check if contact title matches any of the target titles."""
+    if not contact_title or not target_titles:
+        return False
+
+    title_lower = contact_title.lower()
+    for target in target_titles:
+        target_lower = target.lower()
+        # Check if either contains the other, or significant word overlap
+        if target_lower in title_lower or title_lower in target_lower:
+            return True
+        # Check key word overlap (e.g. "IT-Leiter" matches "Leiter IT")
+        target_words = set(w for w in target_lower.replace('-', ' ').split() if len(w) > 2)
+        title_words = set(w for w in title_lower.replace('-', ' ').split() if len(w) > 2)
+        if target_words and title_words and len(target_words & title_words) >= 1:
+            return True
+    return False
+
+
+async def _serper_find_persons(
+    company_name: str,
+    target_titles: Optional[List[str]] = None,
+) -> List[Dict[str, Any]]:
+    """
+    Proactive Serper.dev person search that runs in parallel with other scraping.
+    Searches LinkedIn for department-specific contacts.
+
+    Cost: $0.001 per query
+    Source: untrusted (needs Apify LinkedIn verification)
+
+    Returns:
+        List of candidate dicts with name, title, linkedin_url, source, priority
+    """
+    settings = get_settings()
+    if not settings.serper_api_key:
+        return []
+
+    if not target_titles:
+        return []
+
+    # Build query with top 2 target titles
+    titles_part = " OR ".join(f'"{t}"' for t in target_titles[:2])
+    query = f'({titles_part}) "{company_name}" site:linkedin.com/in'
+
+    logger.info(f"Serper person search: {query[:80]}...")
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.post(
+                "https://google.serper.dev/search",
+                headers={"X-API-KEY": settings.serper_api_key, "Content-Type": "application/json"},
+                json={"q": query, "gl": "de", "hl": "de", "num": 5},
+            )
+            response.raise_for_status()
+            data = response.json()
+
+        items = data.get("organic", [])
+        if not items:
+            return []
+
+        candidates = []
+        from clients.linkedin_search import LinkedInSearchClient
+        li_client = LinkedInSearchClient()
+
+        for item in items:
+            link = item.get("link", "")
+            item_title = item.get("title", "")
+            snippet = item.get("snippet", "")
+
+            if not li_client._is_linkedin_profile_url(link):
+                continue
+
+            # Check company match
+            company_lower = company_name.lower()
+            company_words = [w for w in company_lower.split() if len(w) > 2]
+            combined_text = (item_title + " " + snippet).lower()
+            if not any(word in combined_text for word in company_words):
+                continue
+
+            name = li_client._extract_name_from_linkedin_title(item_title)
+            if not name:
+                continue
+
+            linkedin_url = li_client._normalize_linkedin_url(link)
+            extracted_title = li_client._extract_title_from_snippet(snippet, "")
+
+            candidates.append({
+                "name": name,
+                "title": extracted_title,
+                "linkedin_url": linkedin_url,
+                "source": "serper_search",
+                "priority": 65,
+            })
+
+        logger.info(f"Serper person search found {len(candidates)} candidates")
+        return candidates
+
+    except Exception as e:
+        logger.warning(f"Serper person search failed: {e}")
+        return []
+
+
 async def _scrape_job_url_with_ai(
     url: Optional[str],
     company_name: str,
@@ -1266,10 +1451,9 @@ async def _scrape_job_url_with_ai(
 
     try:
         scraper = JobUrlScraper(timeout=10)
-        # Get HTML content
-        scraped = await scraper.scrape_contact(url)
+        # Get HTML content - now uses AI extraction first, regex fallback
+        scraped = await scraper.scrape_contact(url, company_name=company_name)
 
-        # If traditional scraping found something, return it
         if scraped and scraped.name:
             return ExtractedContact(
                 name=scraped.name,
@@ -1279,8 +1463,6 @@ async def _scrape_job_url_with_ai(
                 source="job_url"
             )
 
-        # Otherwise try AI extraction on the raw text
-        # (This would require modifying JobUrlScraper to expose raw text)
         return None
 
     except Exception as e:

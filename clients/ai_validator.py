@@ -294,7 +294,8 @@ async def validate_and_rank_candidates(
     candidates: List[Dict[str, Any]],
     company_name: str,
     company_domain: Optional[str],
-    job_category: Optional[str] = None
+    job_category: Optional[str] = None,
+    target_titles: Optional[List[str]] = None
 ) -> List[CandidateValidation]:
     """
     Validate and rank all candidates in one AI call.
@@ -330,8 +331,11 @@ async def validate_and_rank_candidates(
     llm = get_llm_client()
 
     category_context = f"\nDie Stelle ist im Bereich: {job_category}" if job_category else ""
+    titles_context = ""
+    if target_titles:
+        titles_context = f"\nGesuchte Zieltitel (höchste Relevanz): {', '.join(target_titles[:5])}"
 
-    prompt = f"""Validiere und bewerte diese Kontakt-Kandidaten für "{company_name}" (Domain: {company_domain or 'unbekannt'}).{category_context}
+    prompt = f"""Validiere und bewerte diese Kontakt-Kandidaten für "{company_name}" (Domain: {company_domain or 'unbekannt'}).{category_context}{titles_context}
 
 Kandidaten:
 {filtered_candidates}
@@ -347,13 +351,16 @@ Prüfe für JEDEN Kandidaten:
    - UNGÜLTIG: Komplett andere Firma (z.B. @freewheel.com bei Diakoneo)
 
 3. relevance_score: 0-100 Punkte
-   - HR/Personal/Recruiting: 100
-   - Abteilungsleiter passend zur Stelle: 80
-   - Geschäftsführer/CEO/Inhaber: 60
+   - Abteilungsleiter/Fachbereichsleiter passend zur Stelle: 100 (HÖCHSTE Priorität!)
+   - Geschäftsführer/CEO/Inhaber: 60 (Backup-Entscheider)
    - Sonstige benannte Kontakte: 40
+   - HR/Personal/Recruiting: 0 (IMMER 0 - für Personalvermittlung komplett unbrauchbar!)
    - Ungültige Kandidaten: 0
 
-4. overall_valid: true wenn name_valid UND (keine E-Mail ODER email_valid)
+   WICHTIG: HR-Manager, Personalleiter, Recruiter sind NIEMALS gültige Kandidaten!
+   Setze overall_valid=false für alle HR/Personal/Recruiting-Kontakte.
+
+4. overall_valid: true wenn name_valid UND (keine E-Mail ODER email_valid) UND NICHT HR/Personal/Recruiting
 
 Antworte als JSON-Array, sortiert nach relevance_score (höchste zuerst):
 [{{

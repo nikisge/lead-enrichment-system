@@ -71,9 +71,10 @@ class JobUrlScraper:
         self._playwright = None
         self._browser = None
 
-    async def scrape_contact(self, url: str) -> Optional[ScrapedContact]:
+    async def scrape_contact(self, url: str, company_name: str = "") -> Optional[ScrapedContact]:
         """
         Scrape job posting URL to find contact person.
+        Uses AI extraction first, regex as fallback.
 
         Returns ScrapedContact if found, None otherwise.
         """
@@ -109,14 +110,50 @@ class JobUrlScraper:
             logger.warning(f"Failed to scrape URL: {url}")
             return None
 
-        # Extract contact from HTML
+        # Try AI extraction first (more reliable than regex)
+        if company_name:
+            contact = await self._extract_contact_with_ai(html, url, company_name)
+            if contact and (contact.name or contact.email):
+                logger.info(f"AI found contact: {contact.name} / {contact.email}")
+                return contact
+
+        # Fallback: regex extraction
         contact = self._extract_contact(html, url)
 
         if contact and (contact.name or contact.email):
-            logger.info(f"Found contact: {contact.name} / {contact.email}")
+            logger.info(f"Regex found contact: {contact.name} / {contact.email}")
             return contact
 
         logger.info("No contact found in job posting")
+        return None
+
+    async def _extract_contact_with_ai(self, html: str, source_url: str, company_name: str) -> Optional[ScrapedContact]:
+        """Extract contact from job posting using AI (more reliable than regex)."""
+        try:
+            from clients.ai_extractor import extract_contacts_from_page
+
+            soup = BeautifulSoup(html, 'lxml')
+            for element in soup(['script', 'style', 'nav']):
+                element.decompose()
+            text = soup.get_text(separator='\n', strip=True)[:15000]
+
+            if len(text) < 100:
+                return None
+
+            contacts = await extract_contacts_from_page(text, company_name, "job_posting")
+
+            if contacts:
+                best = contacts[0]
+                return ScrapedContact(
+                    name=best.name,
+                    email=best.email,
+                    phone=best.phone,
+                    title=best.title,
+                    source_url=source_url,
+                    confidence=0.8
+                )
+        except Exception as e:
+            logger.warning(f"AI contact extraction failed: {e}")
         return None
 
     async def _scrape_with_httpx(self, url: str) -> Optional[str]:

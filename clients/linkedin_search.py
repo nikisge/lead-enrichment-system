@@ -383,58 +383,68 @@ class LinkedInSearchClient:
         company: str,
         domain: Optional[str] = None,
         job_category: Optional[str] = None,
-        max_candidates: int = 3
+        max_candidates: int = 3,
+        target_titles: Optional[List[str]] = None
     ) -> List[dict]:
         """
-        Search for MULTIPLE decision makers at a company.
+        Search for MULTIPLE decision makers at a company using Serper.dev.
         Returns up to max_candidates, prioritizing verified current employees.
 
         Priority:
-        1. HR / Recruiting / Personal (best for job postings)
+        1. Target titles search (direct title search from LLM parser)
         2. Department head matching job category
-        3. General executives (fallback)
+        3. General executives (Geschäftsführer/CEO - last resort)
+
+        HR/Personal/Recruiting are NEVER searched - they are counterproductive
+        for a staffing agency.
 
         Args:
             company: Company name
             domain: Company domain (optional)
             job_category: Job category like "IT", "Sales", etc.
             max_candidates: Maximum number of candidates to return (default 3)
+            target_titles: Specific titles to search for (highest priority)
 
         Returns:
             List of dicts with 'name', 'title', 'linkedin_url', 'verified_current'
         """
-        if not self.api_key or not self.cse_id:
-            logger.warning("Google API key or CSE ID not configured for decision maker search")
-            return []
+        settings = get_settings()
+        if not settings.serper_api_key:
+            # Fallback to Google CSE if Serper not configured
+            if not self.api_key or not self.cse_id:
+                logger.warning("Neither Serper nor Google CSE configured for decision maker search")
+                return []
 
         all_candidates = []
         seen_urls = set()
 
-        # Search 1: HR/Recruiting (combined query)
-        hr_query = "Personalleiter OR HR OR Recruiting OR Personal"
-        candidates = await self._search_decision_maker_combined(company, hr_query, domain, return_all=True)
-        for c in candidates:
-            if c["linkedin_url"] not in seen_urls:
-                seen_urls.add(c["linkedin_url"])
-                all_candidates.append(c)
+        # Search 1: Target titles (most specific, highest priority)
+        if target_titles:
+            titles_query = " OR ".join(f'"{t}"' for t in target_titles[:4])
+            candidates = await self._search_decision_maker_serper(company, titles_query, domain)
+            for c in candidates:
+                if c["linkedin_url"] not in seen_urls:
+                    seen_urls.add(c["linkedin_url"])
+                    all_candidates.append(c)
 
-        # Search 2: Job-category specific (if category provided)
-        if job_category:
+        # Search 2: Job-category specific (if category provided and not enough from titles)
+        if job_category and len(all_candidates) < max_candidates:
             category_query = self._get_category_query(job_category)
             if category_query:
-                candidates = await self._search_decision_maker_combined(company, category_query, domain, return_all=True)
+                candidates = await self._search_decision_maker_serper(company, category_query, domain)
                 for c in candidates:
                     if c["linkedin_url"] not in seen_urls:
                         seen_urls.add(c["linkedin_url"])
                         all_candidates.append(c)
 
-        # Search 3: Executive fallback
-        exec_query = "Geschäftsführer OR CEO OR Inhaber OR Managing Director"
-        candidates = await self._search_decision_maker_combined(company, exec_query, domain, return_all=True)
-        for c in candidates:
-            if c["linkedin_url"] not in seen_urls:
-                seen_urls.add(c["linkedin_url"])
-                all_candidates.append(c)
+        # Search 3: Executive fallback (NO HR!)
+        if len(all_candidates) < max_candidates:
+            exec_query = "Geschäftsführer OR CEO OR Inhaber OR Managing Director"
+            candidates = await self._search_decision_maker_serper(company, exec_query, domain)
+            for c in candidates:
+                if c["linkedin_url"] not in seen_urls:
+                    seen_urls.add(c["linkedin_url"])
+                    all_candidates.append(c)
 
         # Sort: verified first, then by score
         all_candidates.sort(key=lambda x: (not x.get("verified_current", False), -x.get("score", 0)))
@@ -473,6 +483,84 @@ class LinkedInSearchClient:
                 return query
 
         return None
+
+    async def _search_decision_maker_serper(
+        self,
+        company: str,
+        title_query: str,
+        domain: Optional[str] = None
+    ) -> List[dict]:
+        """
+        Search for decision makers using Serper.dev API.
+        Replaces Google CSE for DM search - cheaper ($0.001/query) and no daily limit.
+
+        Returns:
+            List of candidate dicts (empty list if none found)
+        """
+        settings = get_settings()
+        if not settings.serper_api_key:
+            # Fallback to Google CSE
+            return await self._search_decision_maker_combined(company, title_query, domain, return_all=True)
+
+        query = f'({title_query}) "{company}" site:linkedin.com/in'
+        logger.info(f"Serper DM search: {query[:80]}...")
+
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                response = await client.post(
+                    "https://google.serper.dev/search",
+                    headers={"X-API-KEY": settings.serper_api_key, "Content-Type": "application/json"},
+                    json={"q": query, "gl": "de", "hl": "de", "num": 10},
+                )
+                response.raise_for_status()
+                data = response.json()
+
+            items = data.get("organic", [])
+            if not items:
+                return []
+
+            candidates = []
+            for item in items:
+                link = item.get("link", "")
+                item_title = item.get("title", "")
+                snippet = item.get("snippet", "")
+
+                if not self._is_linkedin_profile_url(link):
+                    continue
+
+                # Check if company name appears
+                company_lower = company.lower()
+                company_words = [w for w in company_lower.split() if len(w) > 2]
+                combined_text = (item_title + " " + snippet).lower()
+                company_match = any(word in combined_text for word in company_words)
+
+                if not company_match:
+                    continue
+
+                name = self._extract_name_from_linkedin_title(item_title)
+                if not name:
+                    continue
+
+                linkedin_url = self._normalize_linkedin_url(link)
+                extracted_title = self._extract_title_from_snippet(snippet, "")
+                is_current = self._is_currently_at_company(snippet, item_title, company)
+
+                candidates.append({
+                    "name": name,
+                    "title": extracted_title,
+                    "linkedin_url": linkedin_url,
+                    "verified_current": is_current,
+                    "source": "linkedin_fallback",
+                    "score": 10 if is_current else 1
+                })
+
+            candidates.sort(key=lambda x: x["score"], reverse=True)
+            return candidates
+
+        except Exception as e:
+            logger.error(f"Serper DM search failed: {e}")
+            # Fallback to Google CSE
+            return await self._search_decision_maker_combined(company, title_query, domain, return_all=True)
 
     async def _search_decision_maker_combined(
         self,

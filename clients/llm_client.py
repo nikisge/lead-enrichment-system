@@ -142,8 +142,8 @@ class LLMClient:
                 temperature=actual_temperature,
                 config=config
             )
-        elif self.anthropic_key and "anthropic" in model:
-            # Fallback to direct Anthropic API
+        elif self.anthropic_key:
+            # Fallback to direct Anthropic API (works for all tiers - maps to Haiku/Sonnet)
             response = await self._call_anthropic_direct(
                 prompt=prompt,
                 model=model,
@@ -312,9 +312,12 @@ class LLMClient:
             # Map OpenRouter model name to Anthropic model name
             anthropic_model = model.replace("anthropic/", "")
             if anthropic_model == "claude-haiku-4.5":
-                anthropic_model = "claude-3-5-haiku-20241022"  # Latest Haiku
-            elif anthropic_model == "claude-sonnet-4.5":
-                anthropic_model = "claude-sonnet-4-20250514"  # Latest Sonnet
+                anthropic_model = "claude-haiku-4-5-20251001"
+            elif anthropic_model in ("claude-sonnet-4.5", "claude-sonnet-4.6"):
+                anthropic_model = "claude-sonnet-4-6"
+            elif "anthropic" not in model:
+                # Non-Anthropic model (e.g. Gemini) → fall back to Haiku for fast tier
+                anthropic_model = "claude-haiku-4-5-20251001"
 
             client = AsyncAnthropic(api_key=self.anthropic_key)
 

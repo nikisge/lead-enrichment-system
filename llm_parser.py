@@ -61,7 +61,7 @@ Regeln:
 - Suche nach genannten Ansprechpartnern (oft am Ende: "Ihr Ansprechpartner", "Kontakt", "Bewerbung an")
 - Extrahiere E-Mail-Adressen falls vorhanden (für Kontakt, NICHT für Domain!)
 - Extrahiere Telefonnummern falls vorhanden (Format: +49, 0049, oder 0xxx)
-- Bestimme relevante Titel für Entscheider (HR, Personal, Geschäftsführung)
+- Bestimme relevante Titel für den FACH-Entscheider passend zur Stelle (z.B. IT-Stelle → IT-Leiter/CTO, Sales → Vertriebsleiter). NIEMALS HR/Personal/Recruiting als Zieltitel!
 
 Antworte NUR mit validem JSON im folgenden Format (keine anderen Texte):
 {
@@ -70,7 +70,7 @@ Antworte NUR mit validem JSON im folgenden Format (keine anderen Texte):
     "contact_name": "Vorname Nachname oder null",
     "contact_email": "email@firma.de oder null",
     "contact_phone": "+49 123 456789 oder null",
-    "target_titles": ["HR Manager", "Personalleiter"],
+    "target_titles": ["IT-Leiter", "CTO"],
     "department": "HR/Personal/IT/etc oder null",
     "location": "Stadt, Land oder null"
 }"""
@@ -135,7 +135,7 @@ Beschreibung:
 {payload.description[:6000]}"""
 
     response = await client.messages.create(
-        model="claude-sonnet-4-20250514",
+        model="claude-sonnet-4-6",
         max_tokens=1024,
         system=SYSTEM_PROMPT,
         messages=[
@@ -250,37 +250,76 @@ def _regex_parse(payload: WebhookPayload) -> ParsedJobPosting:
 
 
 def _get_default_titles(job_title: str) -> List[str]:
-    """Get relevant decision maker titles based on job posting."""
+    """Get relevant decision maker titles based on job posting.
+    NEVER returns HR/Personal/Recruiting titles - those are counterproductive
+    for a staffing agency (HR managers lose their job when agency places someone).
+    """
     job_lower = job_title.lower()
+    # Split into words for exact matching of short keywords (avoids 'it' matching in 'Mitarbeiter')
+    job_words = set(job_lower.replace('-', ' ').replace('/', ' ').split())
 
-    # HR/Personnel related
-    if any(x in job_lower for x in ['hr', 'personal', 'recruiting', 'talent']):
-        return [
-            "HR Manager", "HR-Manager", "Personalleiter", "Personalleiterin",
-            "Head of HR", "HR Director", "Leiter Personal",
-            "Recruiting Manager", "Head of Recruiting"
-        ]
-
-    # IT related
-    if any(x in job_lower for x in ['it', 'software', 'developer', 'engineer', 'tech', 'consultant']):
+    # IT related - use word-boundary matching for 'it' to avoid false positives
+    if any(w in job_words for w in ['it', 'devops', 'data']) or \
+       any(x in job_lower for x in ['software', 'developer', 'engineer', 'tech', 'informatik', 'programm']):
         return [
             "IT-Leiter", "Head of IT", "CTO", "IT Manager",
             "Leiter Softwareentwicklung", "Head of Engineering",
-            "HR Manager", "Personalleiter"
+            "VP Engineering", "IT Director"
         ]
 
     # Sales related
-    if any(x in job_lower for x in ['sales', 'vertrieb', 'account']):
+    if any(x in job_lower for x in ['sales', 'vertrieb', 'account manager', 'business development', 'außendienst']):
         return [
             "Vertriebsleiter", "Head of Sales", "Sales Director",
-            "Leiter Vertrieb", "HR Manager", "Personalleiter"
+            "Leiter Vertrieb", "VP Sales", "CSO"
         ]
 
-    # Default: HR + Management
+    # Marketing related (no 'pr' - too short, matches 'Projekt')
+    if any(x in job_lower for x in ['marketing', 'kommunikation', 'content', 'social media', 'public relation']):
+        return [
+            "Marketing-Leiter", "Head of Marketing", "CMO",
+            "Marketing Director", "Leiter Marketing"
+        ]
+
+    # Finance related
+    if any(x in job_lower for x in ['finance', 'finanz', 'accounting', 'buchhal', 'controller']):
+        return [
+            "CFO", "Finanzleiter", "Head of Finance",
+            "Kaufmännischer Leiter", "Finance Director"
+        ]
+
+    # Production / Manufacturing
+    if any(x in job_lower for x in ['produktion', 'fertigung', 'manufacturing', 'werkleiter', 'schichtleiter']):
+        return [
+            "Produktionsleiter", "Werkleiter", "Head of Production",
+            "Betriebsleiter", "COO"
+        ]
+
+    # Logistics / Supply Chain
+    if any(x in job_lower for x in ['logistik', 'supply chain', 'lager', 'versand', 'einkauf', 'procurement']):
+        return [
+            "Logistikleiter", "Head of Logistics", "Supply Chain Manager",
+            "Einkaufsleiter", "Head of Procurement"
+        ]
+
+    # Healthcare / Medical
+    if any(x in job_lower for x in ['pflege', 'medizin', 'arzt', 'klinik', 'krankenhaus', 'gesundheit']):
+        return [
+            "Chefarzt", "Klinikleiter", "Medical Director",
+            "Ärztlicher Direktor", "Pflegedienstleitung"
+        ]
+
+    # Consulting
+    if any(x in job_lower for x in ['consulting', 'consultant', 'beratung', 'berater']):
+        return [
+            "Partner", "Managing Consultant", "Principal",
+            "Director", "Geschäftsführer"
+        ]
+
+    # Default: General management (NO HR!)
     return [
-        "HR Manager", "Personalleiter", "Personalleiterin",
         "Geschäftsführer", "Geschäftsführerin", "CEO",
-        "Head of HR", "Leiter Personal"
+        "Inhaber", "Abteilungsleiter", "Managing Director"
     ]
 
 

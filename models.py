@@ -67,6 +67,8 @@ class DecisionMaker(BaseModel):
     apollo_id: Optional[str] = None
     verified_current: bool = True  # False if we're not sure they still work there
     verification_note: Optional[str] = None  # e.g. "(nicht verifiziert - könnte nicht mehr dort arbeiten)"
+    match_reason: Optional[str] = None  # e.g. "IT-Leiter - passend zur IT-Stelle"
+    department_match: Optional[bool] = None  # True wenn Kontakt zur Abteilung passt
 
 
 # Phone Result

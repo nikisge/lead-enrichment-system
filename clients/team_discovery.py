@@ -45,6 +45,9 @@ TEAM_URL_PATTERNS = [
     "/uber-uns",
     "/about-us",
     "/about",
+    "/ueber-uns/team",
+    "/about/team",
+    "/unternehmen/team",
     "/ansprechpartner",
     "/kontakt",
     "/contact",
@@ -57,6 +60,11 @@ TEAM_URL_PATTERNS = [
     "/geschaeftsleitung",
     "/fuehrungsteam",
     "/leadership",
+    "/unternehmen",
+    "/firma",
+    "/company",
+    "/who-we-are",
+    "/wer-wir-sind",
 ]
 
 # Keywords to find team links on homepage (German + English)
@@ -76,6 +84,11 @@ TEAM_PAGE_SELECTORS = [
     ".leadership", ".management", ".geschaeftsfuehrung",
     # Common grid/card patterns
     ".person-card", ".team-grid", ".people-grid",
+    ".card", ".profile-card", ".bio",
+    "[class*='about']", "[class*='profile']",
+    "[class*='card']", "[class*='grid'] [class*='item']",
+    ".swiper-slide",  # Slider-based team pages
+    "[data-team]", "[data-member]",  # Data attributes
     # WordPress patterns
     ".wp-block-team", ".elementor-team-member",
 ]
@@ -129,7 +142,8 @@ class TeamDiscovery:
         company_name: str,
         domain: Optional[str] = None,
         job_category: Optional[str] = None,
-        max_pages: int = 2
+        max_pages: int = 2,
+        target_titles: Optional[List[str]] = None
     ) -> TeamDiscoveryResult:
         """
         Full discovery process: Find team pages smartly, scrape, extract contacts.
@@ -162,31 +176,34 @@ class TeamDiscovery:
         base_url = f"https://{domain}"
         logger.info(f"🌐 Base URL: {base_url}")
 
-        # Step 1: Try direct URL patterns
-        logger.info("📍 Step 1: Checking direct team page URLs...")
-        direct_pages = await self._check_direct_urls(base_url)
+        # Step 1: Direct URLs + Sitemap in parallel (fast)
+        logger.info("📍 Step 1: Checking direct URLs + sitemap in parallel...")
+        direct_task = self._check_direct_urls(base_url)
+        sitemap_task = self._scan_sitemap(base_url)
 
-        if direct_pages:
-            logger.info(f"✓ Found {len(direct_pages)} direct team page(s)")
-            for page in direct_pages:
+        direct_pages_result, sitemap_pages_result = await asyncio.gather(
+            direct_task, sitemap_task, return_exceptions=True
+        )
+
+        discovered_pages = []
+        if isinstance(direct_pages_result, list) and direct_pages_result:
+            discovered_pages.extend(direct_pages_result)
+            logger.info(f"✓ Found {len(direct_pages_result)} direct team page(s)")
+            for page in direct_pages_result:
                 logger.info(f"  → {page.url} (score: {page.relevance_score})")
         else:
             logger.info("✗ No direct team URLs found")
 
-        # Step 2: Check sitemap
-        discovered_pages = list(direct_pages)  # Start with direct URLs
+        if isinstance(sitemap_pages_result, list) and sitemap_pages_result:
+            discovered_pages.extend(sitemap_pages_result)
+            logger.info(f"✓ Found {len(sitemap_pages_result)} team page(s) in sitemap")
+            for page in sitemap_pages_result:
+                logger.info(f"  → {page.url}")
+        else:
+            logger.info("✗ No team pages in sitemap (or no sitemap)")
 
-        if len(discovered_pages) < 2:
-            logger.info("📍 Step 2: Scanning sitemap.xml...")
-            sitemap_pages = await self._scan_sitemap(base_url)
-
-            if sitemap_pages:
-                logger.info(f"✓ Found {len(sitemap_pages)} team page(s) in sitemap")
-                for page in sitemap_pages:
-                    logger.info(f"  → {page.url}")
-                discovered_pages.extend(sitemap_pages)
-            else:
-                logger.info("✗ No team pages in sitemap (or no sitemap)")
+        # Deduplicate early
+        discovered_pages = self._deduplicate_pages(discovered_pages)
 
         # Step 3: Scan homepage for team links
         if len(discovered_pages) < 2:
@@ -223,7 +240,7 @@ class TeamDiscovery:
 
         for page in discovered_pages[:max_pages]:
             logger.info(f"🔍 Scraping: {page.url}")
-            contacts = await self._scrape_team_page(page.url, company_name)
+            contacts = await self._scrape_team_page(page.url, company_name, target_titles=target_titles)
 
             if contacts:
                 all_contacts.extend(contacts)
@@ -366,10 +383,13 @@ class TeamDiscovery:
 
                 # Check if URL contains team-related keywords
                 team_keywords = [
-                    'team', 'ueber-uns', 'uber-uns', 'about',
+                    'team', 'ueber-uns', 'uber-uns', 'about', 'über-uns',
                     'kontakt', 'contact', 'ansprechpartner',
-                    'mitarbeiter', 'menschen', 'people',
-                    'management', 'fuehrung', 'leadership'
+                    'mitarbeiter', 'menschen', 'people', 'staff',
+                    'management', 'fuehrung', 'leadership', 'führung',
+                    'unternehmen', 'company', 'firma', 'wir',
+                    'geschaeftsfuehrung', 'vorstand', 'board',
+                    'who-we-are', 'wer-wir-sind',
                 ]
 
                 for keyword in team_keywords:
@@ -460,7 +480,8 @@ class TeamDiscovery:
     async def _scrape_team_page(
         self,
         url: str,
-        company_name: str
+        company_name: str,
+        target_titles: Optional[List[str]] = None
     ) -> List[ExtractedContact]:
         """
         Scrape a team page with improved Playwright settings.
@@ -529,7 +550,7 @@ class TeamDiscovery:
 
         # Use AI to extract contacts
         logger.info(f"🤖 Running AI contact extraction...")
-        return await extract_contacts_from_page(text, company_name, "team")
+        return await extract_contacts_from_page(text, company_name, "team", target_titles=target_titles)
 
     async def _scrape_with_playwright_v2(self, url: str) -> Optional[str]:
         """
@@ -592,6 +613,23 @@ class TeamDiscovery:
                     else:
                         # Team selector found - small additional wait
                         await page.wait_for_timeout(2000)
+
+                    # Try to dismiss cookie banners / popups
+                    cookie_selectors = [
+                        "[class*='cookie'] button", "[id*='cookie'] button",
+                        ".cc-dismiss", "#accept-cookies", ".cookie-accept",
+                        "[data-action='accept']", ".consent-accept",
+                        "button[class*='accept']", "button[class*='agree']",
+                    ]
+                    for sel in cookie_selectors:
+                        try:
+                            btn = page.locator(sel).first
+                            if await btn.is_visible(timeout=500):
+                                await btn.click()
+                                logger.debug(f"  → Dismissed cookie banner: {sel}")
+                                break
+                        except Exception:
+                            pass
 
                     # Full page scroll to trigger lazy loading
                     logger.info(f"  → Scrolling page to load lazy content...")
@@ -702,7 +740,8 @@ class TeamDiscovery:
 async def discover_team_contacts(
     company_name: str,
     domain: Optional[str] = None,
-    job_category: Optional[str] = None
+    job_category: Optional[str] = None,
+    target_titles: Optional[List[str]] = None
 ) -> TeamDiscoveryResult:
     """
     Discover team contacts for a company.
@@ -714,7 +753,8 @@ async def discover_team_contacts(
         return await discovery.discover_and_extract(
             company_name=company_name,
             domain=domain,
-            job_category=job_category
+            job_category=job_category,
+            target_titles=target_titles
         )
     finally:
         await discovery.close()

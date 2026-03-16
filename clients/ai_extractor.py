@@ -19,7 +19,7 @@ from utils.cost_tracker import track_llm
 logger = logging.getLogger(__name__)
 
 # Maximum characters to send to LLM (context protection)
-MAX_LLM_INPUT_CHARS = 12000
+MAX_LLM_INPUT_CHARS = 20000
 
 
 @dataclass
@@ -61,7 +61,9 @@ def truncate_text(text: str, max_chars: int = MAX_LLM_INPUT_CHARS) -> str:
 async def extract_contacts_from_page(
     page_text: str,
     company_name: str,
-    page_type: str = "team"
+    page_type: str = "team",
+    target_titles: Optional[List[str]] = None,
+    job_category: Optional[str] = None
 ) -> List[ExtractedContact]:
     """
     Extract contact persons from any page using AI.
@@ -70,6 +72,8 @@ async def extract_contacts_from_page(
         page_text: Raw text content from the page
         company_name: Company name for context
         page_type: Type of page (team, impressum, job_posting, about)
+        target_titles: Preferred job titles to prioritize in extraction
+        job_category: Job category for context
 
     Returns:
         List of extracted contacts
@@ -83,13 +87,22 @@ async def extract_contacts_from_page(
 
     llm = get_llm_client()
 
+    priority_hint = ""
+    if target_titles:
+        titles_str = ', '.join(target_titles[:5])
+        priority_hint = f"""
+
+PRIORITÄT: Wir suchen bevorzugt Personen mit folgenden Titeln/Rollen: {titles_str}
+Sortiere die Ergebnisse so, dass Personen mit passenden Titeln zuerst kommen.
+NICHT suchen: HR-Manager, Personalleiter, Recruiter (für uns irrelevant)."""
+
     prompt = f"""Analysiere diesen {page_type}-Text von "{company_name}" und extrahiere alle echten Mitarbeiter/Ansprechpartner.
 
 WICHTIG - Extrahiere NUR:
 - Echte Personennamen (Vor- und Nachname)
 - KEINE Überschriften, Menüpunkte oder Platzhalter
 - KEINE generischen Texte wie "Unser Team" oder "Kontaktieren Sie uns"
-
+{priority_hint}
 Für jeden gefundenen Mitarbeiter gib zurück:
 - name: Vollständiger Name (Vor- und Nachname)
 - title: Position/Jobtitel falls vorhanden (sonst null)
@@ -299,77 +312,6 @@ Falls KEIN Ansprechpartner gefunden wurde:
 
     logger.info(f"Extracted job contact: {contact.name} ({contact.title})")
     return contact
-
-
-async def extract_contacts_with_priority(
-    page_text: str,
-    company_name: str,
-    job_category: Optional[str] = None
-) -> List[ExtractedContact]:
-    """
-    Extract contacts and prioritize by relevance.
-
-    Priority:
-    1. HR / Recruiting (100)
-    2. Department head matching job category (80)
-    3. Executives / Geschäftsführer (60)
-    4. Other named contacts (40)
-
-    Args:
-        page_text: Page content
-        company_name: Company name
-        job_category: Optional job category for relevance scoring
-
-    Returns:
-        List of contacts sorted by priority
-    """
-    contacts = await extract_contacts_from_page(page_text, company_name, "team")
-
-    if not contacts:
-        return []
-
-    # Build priority scoring prompt
-    llm = get_llm_client()
-
-    contacts_data = [
-        {"name": c.name, "title": c.title or "Unbekannt"}
-        for c in contacts
-    ]
-
-    category_hint = f"\nDie Stelle ist im Bereich: {job_category}" if job_category else ""
-
-    prompt = f"""Bewerte diese Kontakte von "{company_name}" nach Relevanz als Ansprechpartner für Bewerbungen.{category_hint}
-
-Kontakte:
-{contacts_data}
-
-Bewertungskriterien:
-- HR/Personal/Recruiting: 100 Punkte
-- Abteilungsleiter passend zur Stelle: 80 Punkte
-- Geschäftsführer/CEO/Inhaber: 60 Punkte
-- Sonstige: 40 Punkte
-
-Antworte als JSON-Array, sortiert nach Priorität (höchste zuerst):
-[{{"name": "...", "priority": 100}}]"""
-
-    result = await llm.call_json(prompt, tier=ModelTier.FAST)
-
-    if not result or not isinstance(result, list):
-        return contacts
-
-    # Create priority map
-    priority_map = {}
-    for item in result:
-        if isinstance(item, dict) and item.get("name"):
-            priority_map[item["name"].lower()] = item.get("priority", 50)
-
-    # Sort contacts by priority
-    def get_priority(contact: ExtractedContact) -> int:
-        return priority_map.get(contact.name.lower(), 50)
-
-    contacts.sort(key=get_priority, reverse=True)
-
-    return contacts
 
 
 async def ai_match_linkedin_to_name(
