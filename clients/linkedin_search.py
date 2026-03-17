@@ -393,10 +393,8 @@ class LinkedInSearchClient:
         Priority:
         1. Target titles search (direct title search from LLM parser)
         2. Department head matching job category
-        3. General executives (Geschäftsführer/CEO - last resort)
-
-        HR/Personal/Recruiting are NEVER searched - they are counterproductive
-        for a staffing agency.
+        3. HR/Recruiting (lower priority but valid)
+        4. General executives (Geschäftsführer/CEO - last resort)
 
         Args:
             company: Company name
@@ -437,7 +435,16 @@ class LinkedInSearchClient:
                         seen_urls.add(c["linkedin_url"])
                         all_candidates.append(c)
 
-        # Search 3: Executive fallback (NO HR!)
+        # Search 3: HR/Recruiting (lower priority but valid)
+        if len(all_candidates) < max_candidates:
+            hr_query = "Personalleiter OR HR Manager OR Recruiting OR Head of HR"
+            candidates = await self._search_decision_maker_serper(company, hr_query, domain)
+            for c in candidates:
+                if c["linkedin_url"] not in seen_urls:
+                    seen_urls.add(c["linkedin_url"])
+                    all_candidates.append(c)
+
+        # Search 4: Executive fallback
         if len(all_candidates) < max_candidates:
             exec_query = "Geschäftsführer OR CEO OR Inhaber OR Managing Director"
             candidates = await self._search_decision_maker_serper(company, exec_query, domain)

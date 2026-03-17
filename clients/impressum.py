@@ -348,15 +348,15 @@ class ImpressumScraper:
             s = 0
             title_lower = (member.title or "").lower()
 
-            # HR/Recruiting = highest priority
-            if any(k in title_lower for k in hr_keywords):
+            # Category-relevant = highest priority (Fachbereich)
+            if category_keywords and any(k in title_lower for k in category_keywords):
                 s += 100
 
-            # Category-relevant
-            if category_keywords and any(k in title_lower for k in category_keywords):
+            # HR/Recruiting = lower priority but valid
+            if any(k in title_lower for k in hr_keywords):
                 s += 50
 
-            # Executives = fallback
+            # Executives = last fallback
             if any(k in title_lower for k in exec_keywords):
                 s += 25
 

@@ -352,15 +352,15 @@ Prüfe für JEDEN Kandidaten:
 
 3. relevance_score: 0-100 Punkte
    - Abteilungsleiter/Fachbereichsleiter passend zur Stelle: 100 (HÖCHSTE Priorität!)
-   - Geschäftsführer/CEO/Inhaber: 60 (Backup-Entscheider)
+   - HR/Personal/Recruiting: 50 (niedrigere Priorität als Fachbereich, aber gültig!)
    - Sonstige benannte Kontakte: 40
-   - HR/Personal/Recruiting: 0 (IMMER 0 - für Personalvermittlung komplett unbrauchbar!)
+   - Geschäftsführer/CEO/Inhaber: 15 (letzter Fallback - auch MIT Telefon nicht bevorzugen!)
    - Ungültige Kandidaten: 0
 
-   WICHTIG: HR-Manager, Personalleiter, Recruiter sind NIEMALS gültige Kandidaten!
-   Setze overall_valid=false für alle HR/Personal/Recruiting-Kontakte.
+   HINWEIS: Geschäftsführer/CEO aus dem Impressum sind nur ein Backup.
+   Selbst wenn sie eine Telefonnummer haben, sollen Fachbereich- und HR-Kontakte bevorzugt werden.
 
-4. overall_valid: true wenn name_valid UND (keine E-Mail ODER email_valid) UND NICHT HR/Personal/Recruiting
+4. overall_valid: true wenn name_valid UND (keine E-Mail ODER email_valid)
 
 Antworte als JSON-Array, sortiert nach relevance_score (höchste zuerst):
 [{{
