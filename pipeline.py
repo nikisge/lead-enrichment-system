@@ -1120,7 +1120,8 @@ async def _enrich_lead_inner(
             verified_current=best_data.get("verified_current", False),
             verification_note=best_data.get("verification_note"),
             match_reason=match_reason,
-            department_match=dept_match
+            department_match=dept_match,
+            source=_get_source_label(best_data)
         )
 
         if best_phone:
@@ -1152,7 +1153,8 @@ async def _enrich_lead_inner(
             verified_current=candidate_data.get("verified_current", False),
             verification_note=candidate_data.get("verification_note"),
             match_reason=match_reason,
-            department_match=dept_match
+            department_match=dept_match,
+            source=_get_source_label(candidate_data)
         )
         enrichment_path.append("using_best_candidate_no_phone")
         logger.info(f"Using best candidate without phone: {best.name}")
@@ -1311,6 +1313,20 @@ async def enrich_lead_test_mode(payload: WebhookPayload) -> EnrichmentResult:
 
 
 # ========== HELPER FUNCTIONS ==========
+
+
+def _get_source_label(candidate_data: Dict[str, Any]) -> str:
+    """Get human-readable source label for the decision maker."""
+    source = candidate_data.get("source", "unknown")
+    source_labels = {
+        "job_url": "Stellenanzeige",
+        "llm_parse": "Stellenanzeige",
+        "team_page": "Team-Seite",
+        "impressum": "Impressum",
+        "serper_search": "Google-Suche",
+        "linkedin_fallback": "LinkedIn-Suche",
+    }
+    return source_labels.get(source, source)
 
 
 def _build_match_reason(candidate_data: Dict[str, Any], target_titles: List[str], job_category: Optional[str]) -> str:

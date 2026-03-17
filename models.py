@@ -69,6 +69,7 @@ class DecisionMaker(BaseModel):
     verification_note: Optional[str] = None  # e.g. "(nicht verifiziert - könnte nicht mehr dort arbeiten)"
     match_reason: Optional[str] = None  # e.g. "IT-Leiter - passend zur IT-Stelle"
     department_match: Optional[bool] = None  # True wenn Kontakt zur Abteilung passt
+    source: Optional[str] = None  # e.g. "Impressum", "Team-Seite", "Google-Suche"
 
 
 # Phone Result
