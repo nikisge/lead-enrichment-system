@@ -473,20 +473,36 @@ class ApifyLinkedInClient:
 
     def _normalize_company_name(self, name: str) -> str:
         """Normalize company name for comparison."""
-        # Remove common suffixes
+        normalized = name.lower().strip()
+
+        # Normalize umlauts and special chars (ö→oe, ü→ue, ä→ae, ß→ss)
+        umlaut_map = {
+            'ö': 'oe', 'ü': 'ue', 'ä': 'ae', 'ß': 'ss',
+            'ô': 'o', 'é': 'e', 'è': 'e', 'ê': 'e', 'á': 'a', 'à': 'a',
+        }
+        for char, replacement in umlaut_map.items():
+            normalized = normalized.replace(char, replacement)
+
+        # Remove common legal suffixes (longest first to avoid partial matches)
         suffixes = [
-            " gmbh", " ag", " se", " kg", " ohg", " gbr", " ug",
             " gmbh & co. kg", " gmbh & co kg", " co. kg",
+            " gmbh", " ag", " se", " kg", " ohg", " gbr", " ug",
             " inc", " inc.", " ltd", " ltd.", " llc", " corp", " corp.",
-            " holding", " group", " international"
+            " holding", " group", " international",
+            " e.v.", " e.v", " mbh",
         ]
 
-        normalized = name.lower().strip()
         for suffix in suffixes:
             if normalized.endswith(suffix):
                 normalized = normalized[:-len(suffix)].strip()
 
-        return normalized
+        # Remove "dr." prefix (common in German company names like "Dr. Hönle")
+        if normalized.startswith("dr. "):
+            normalized = normalized[4:]
+        if normalized.startswith("dr."):
+            normalized = normalized[3:]
+
+        return normalized.strip()
 
     def _company_names_match(self, expected: str, actual: str) -> bool:
         """Check if company names match (fuzzy)."""
