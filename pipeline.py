@@ -959,8 +959,83 @@ async def _enrich_lead_inner(
         top_candidates = verified_candidates
         logger.info(f"Using {len(verified_candidates)} verified candidates for phone enrichment")
     else:
-        logger.warning("No verified candidates - no phone enrichment will be attempted")
-        top_candidates = []  # Don't use unverified candidates for paid APIs
+        logger.warning("No verified candidates after Phase 5 - trying recovery DM search...")
+        top_candidates = []
+
+        # ===== PHASE 5b: RECOVERY DM SEARCH =====
+        # All candidates failed LinkedIn verification. Fresh search for new people.
+        if parsed.company_name:
+            try:
+                recovery_candidates = await linkedin_client.find_multiple_decision_makers(
+                    company=parsed.company_name,
+                    domain=company_info.domain,
+                    job_category=payload.category,
+                    max_candidates=3,
+                    target_titles=parsed.target_titles
+                )
+                # Filter out candidates we already tried
+                tried_names = {_normalize_name_for_dedup(c.get("name", "")) for c in all_candidates}
+                recovery_candidates = [c for c in recovery_candidates if c.get("name") and _normalize_name_for_dedup(c["name"]) not in tried_names]
+
+                if recovery_candidates:
+                    enrichment_path.append(f"recovery_dm_search_{len(recovery_candidates)}_new")
+                    logger.info(f"Recovery DM search found {len(recovery_candidates)} new candidates")
+
+                    # Quick validation + verification for recovery candidates
+                    recovery_raw = [
+                        {"name": c["name"], "title": c.get("title"),
+                         "linkedin_url": c.get("linkedin_url"),
+                         "source": "linkedin_fallback", "priority": 40}
+                        for c in recovery_candidates
+                    ]
+                    all_candidates.extend(recovery_raw)
+
+                    recovery_validated = await validate_and_rank_candidates(
+                        candidates=recovery_raw,
+                        company_name=parsed.company_name,
+                        company_domain=company_info.domain,
+                        job_category=payload.category,
+                        target_titles=parsed.target_titles
+                    )
+
+                    # Verify top recovery candidate via LinkedIn
+                    for rc in recovery_validated[:2]:
+                        rc_data = next(
+                            (c for c in all_candidates if _normalize_name_for_dedup(c.get("name", "")) == _normalize_name_for_dedup(rc.name or "")),
+                            {}
+                        )
+                        rc_linkedin = rc_data.get("linkedin_url")
+                        if rc_linkedin:
+                            try:
+                                rc_verification = await apify_client.verify_employment(
+                                    linkedin_url=rc_linkedin,
+                                    expected_company=parsed.company_name
+                                )
+                                track_apify(success=True)
+                                if rc_verification and rc_verification.is_currently_employed:
+                                    rc_data["linkedin_verified"] = True
+                                    rc_data["verified_current"] = True
+                                    rc_data["verification_note"] = f"Recovery: {rc_verification.verification_note}"
+                                    verified_candidates.append(rc)
+                                    enrichment_path.append(f"recovery_verified_{_safe_first_name(rc.name)}")
+                                    logger.info(f"RECOVERY VERIFIED: {rc.name}")
+                                    break
+                            except Exception as e:
+                                logger.warning(f"Recovery Apify verification failed: {e}")
+                                track_apify(success=False)
+
+                    if verified_candidates:
+                        top_candidates = verified_candidates
+                        logger.info(f"Recovery successful: {len(verified_candidates)} verified candidates")
+                    else:
+                        enrichment_path.append("recovery_dm_no_verified")
+                        logger.warning("Recovery DM search: no candidates could be verified")
+                else:
+                    enrichment_path.append("recovery_dm_no_new_candidates")
+                    logger.info("Recovery DM search: no new candidates found (all already tried)")
+            except Exception as e:
+                logger.warning(f"Recovery DM search failed: {e}")
+                enrichment_path.append("recovery_dm_error")
 
     # ========== PHASE 6: PHONE ENRICHMENT + COMPANY RESEARCH (parallel) ==========
 
