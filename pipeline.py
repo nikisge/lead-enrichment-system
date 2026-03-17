@@ -2263,18 +2263,12 @@ Wenn KEINE passende Domain gefunden: {{"domain": null, "reason": "..."}}"""
         response = await llm_client.call(
             prompt=ai_prompt,
             tier="balanced",  # Haiku 4.5 — fast + accurate for structured selection
-            max_tokens=200,
+            max_tokens=400,
         )
 
-        import json
-        content = response.content.strip()
-        if content.startswith("```"):
-            content = content.split("```")[1]
-            if content.startswith("json"):
-                content = content[4:]
-        content = content.strip()
-
-        ai_result = json.loads(content)
+        ai_result = llm_client._parse_json_response(response.content)
+        if not ai_result or not isinstance(ai_result, dict):
+            raise ValueError(f"Could not parse JSON from AI response: {response.content[:200]}")
         chosen_domain = ai_result.get("domain")
         ai_phone = ai_result.get("phone") or None
         ai_address = ai_result.get("address") or None

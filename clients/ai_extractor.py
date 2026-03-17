@@ -120,7 +120,10 @@ Falls keine echten Personen gefunden werden: []"""
     result = await llm.call_json(prompt, tier=ModelTier.BALANCED)
     track_llm("contact_extract", tier="sonnet")  # Contact extraction uses Sonnet
 
-    if not result or not isinstance(result, list):
+    if not result:
+        logger.info(f"AI contact extraction found no contacts for {page_type}")
+        return []
+    if not isinstance(result, list):
         logger.warning(f"AI contact extraction returned invalid result for {page_type}: type={type(result)}")
         return []
 

@@ -7,7 +7,7 @@
 #   ./retest.sh "Firmenname"       # Einzelne Firma
 #   ./retest.sh recent             # Letzte 20 Runs aus Dashboard re-testen
 
-SERVER="http://localhost:8000"
+SERVER="http://localhost:8070"
 RESULTS_FILE="/tmp/retest_results_$(date +%Y%m%d_%H%M%S).json"
 
 # Colors
