@@ -798,6 +798,22 @@ async def _enrich_lead_inner(
             logger.warning(f"DM fallback after validation failed: {e}")
             enrichment_path.append("dm_fallback_post_validation_error")
 
+    # Reorder: department-matching candidates first for Phase 5 verification
+    # This ensures e.g. a CFO is verified before the CEO when searching for "Buchhalter"
+    if parsed.target_titles and validated_candidates:
+        def _dept_sort_key(candidate):
+            cdata = next((c for c in all_candidates if _normalize_name_for_dedup(c.get("name", "")) == _normalize_name_for_dedup(candidate.name or "")), {})
+            is_dept = _is_department_match(cdata.get("title"), parsed.target_titles)
+            # Department match = 0 (first), non-match = 1 (second)
+            return (0 if is_dept else 1)
+
+        original_order = [c.name for c in validated_candidates[:3]]
+        validated_candidates.sort(key=_dept_sort_key)
+        new_order = [c.name for c in validated_candidates[:3]]
+        if original_order != new_order:
+            logger.info(f"Reordered candidates for dept priority: {new_order}")
+            enrichment_path.append("dept_priority_reorder")
+
     # Take top 3 candidates for verification (try up to 3 if earlier ones fail)
     MAX_CANDIDATES_TO_TRY = 3
     top_candidates = validated_candidates[:MAX_CANDIDATES_TO_TRY]
