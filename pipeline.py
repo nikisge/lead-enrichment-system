@@ -920,6 +920,9 @@ async def _enrich_lead_inner(
                 candidate_data["linkedin_url"] = linkedin_url
                 candidate_data["linkedin_verified"] = True
                 candidate_data["verification_note"] = verification.verification_note
+                if not candidate_data.get("title") and verification.current_title:
+                    candidate_data["title"] = verification.current_title
+                    logger.info(f"Title from LinkedIn: {verification.current_title}")
                 enrichment_path.append(f"linkedin_verified_{_safe_first_name(candidate.name)}")
                 logger.info(f"LINKEDIN VERIFIED: {candidate.name} - {verification.verification_note}")
             else:
