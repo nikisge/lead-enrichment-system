@@ -142,7 +142,7 @@ class TeamDiscovery:
         company_name: str,
         domain: Optional[str] = None,
         job_category: Optional[str] = None,
-        max_pages: int = 2,
+        max_pages: int = 3,
         target_titles: Optional[List[str]] = None
     ) -> TeamDiscoveryResult:
         """
@@ -176,21 +176,23 @@ class TeamDiscovery:
         base_url = f"https://{domain}"
         logger.info(f"🌐 Base URL: {base_url}")
 
-        # Step 1: Direct URLs + Sitemap in parallel (fast)
-        logger.info("📍 Step 1: Checking direct URLs + sitemap in parallel...")
+        # Step 1: ALL discovery methods in parallel
+        logger.info("📍 Step 1: Running all discovery methods in parallel...")
         direct_task = self._check_direct_urls(base_url)
         sitemap_task = self._scan_sitemap(base_url)
+        homepage_task = self._scan_homepage_links(base_url)
 
-        direct_pages_result, sitemap_pages_result = await asyncio.gather(
-            direct_task, sitemap_task, return_exceptions=True
+        direct_pages_result, sitemap_pages_result, homepage_pages_result = await asyncio.gather(
+            direct_task, sitemap_task, homepage_task, return_exceptions=True
         )
 
         discovered_pages = []
+
         if isinstance(direct_pages_result, list) and direct_pages_result:
             discovered_pages.extend(direct_pages_result)
             logger.info(f"✓ Found {len(direct_pages_result)} direct team page(s)")
             for page in direct_pages_result:
-                logger.info(f"  → {page.url} (score: {page.relevance_score})")
+                logger.info(f"  → {page.url} (score: {page.relevance_score:.2f})")
         else:
             logger.info("✗ No direct team URLs found")
 
@@ -202,21 +204,13 @@ class TeamDiscovery:
         else:
             logger.info("✗ No team pages in sitemap (or no sitemap)")
 
-        # Deduplicate early
-        discovered_pages = self._deduplicate_pages(discovered_pages)
-
-        # Step 3: Scan homepage for team links
-        if len(discovered_pages) < 2:
-            logger.info("📍 Step 3: Scanning homepage for team links...")
-            homepage_links = await self._scan_homepage_links(base_url)
-
-            if homepage_links:
-                logger.info(f"✓ Found {len(homepage_links)} team link(s) on homepage")
-                for page in homepage_links:
-                    logger.info(f"  → {page.url} ('{page.title}')")
-                discovered_pages.extend(homepage_links)
-            else:
-                logger.info("✗ No team links found on homepage")
+        if isinstance(homepage_pages_result, list) and homepage_pages_result:
+            discovered_pages.extend(homepage_pages_result)
+            logger.info(f"✓ Found {len(homepage_pages_result)} team link(s) on homepage")
+            for page in homepage_pages_result:
+                logger.info(f"  → {page.url} ('{page.title}')")
+        else:
+            logger.info("✗ No team links found on homepage")
 
         # Deduplicate and sort by relevance
         discovered_pages = self._deduplicate_pages(discovered_pages)
@@ -231,26 +225,40 @@ class TeamDiscovery:
                 success=False
             )
 
-        logger.info(f"📍 Step 4: Scraping {min(len(discovered_pages), max_pages)} best page(s)...")
+        pages_to_scrape = discovered_pages[:max_pages]
+        logger.info(f"📍 Step 2: Scraping {len(pages_to_scrape)} best page(s) in parallel...")
+        for page in pages_to_scrape:
+            logger.info(f"  → {page.url} (source: {page.source}, score: {page.relevance_score:.2f})")
 
-        # Step 4: Scrape best pages
+        # Step 2: Scrape pages in parallel
+        scrape_tasks = [
+            self._scrape_team_page(
+                page.url, company_name,
+                target_titles=target_titles,
+                job_category=job_category,
+                company_domain=domain
+            )
+            for page in pages_to_scrape
+        ]
+        scrape_results = await asyncio.gather(*scrape_tasks, return_exceptions=True)
+
         all_contacts = []
         scraped_urls = []
         discovery_methods = set()
 
-        for page in discovered_pages[:max_pages]:
-            logger.info(f"🔍 Scraping: {page.url}")
-            contacts = await self._scrape_team_page(page.url, company_name, target_titles=target_titles)
-
-            if contacts:
-                all_contacts.extend(contacts)
+        for page, result in zip(pages_to_scrape, scrape_results):
+            if isinstance(result, Exception):
+                logger.warning(f"  ✗ Scraping failed for {page.url}: {result}")
+                continue
+            if result:
+                all_contacts.extend(result)
                 scraped_urls.append(page.url)
                 discovery_methods.add(page.source)
-                logger.info(f"  ✓ Extracted {len(contacts)} contact(s)")
-                for c in contacts:
+                logger.info(f"  ✓ {page.url}: {len(result)} contact(s)")
+                for c in result:
                     logger.info(f"    → {c.name} ({c.title or 'no title'})")
             else:
-                logger.info(f"  ✗ No contacts extracted")
+                logger.info(f"  ✗ {page.url}: No contacts extracted")
 
         # Deduplicate contacts by name
         unique_contacts = self._deduplicate_contacts(all_contacts)
@@ -333,14 +341,15 @@ class TeamDiscovery:
                 # Check if this is a sitemap index
                 sitemap_refs = root.findall('.//ns:sitemap/ns:loc', namespaces)
                 if sitemap_refs:
-                    # It's an index - look for sub-sitemaps about pages
-                    for sitemap_ref in sitemap_refs:
+                    # It's an index - check all sub-sitemaps (max 5) and accumulate results
+                    all_sub_pages = []
+                    for sitemap_ref in sitemap_refs[:5]:
                         sub_url = sitemap_ref.text
-                        if any(kw in sub_url.lower() for kw in ['page', 'post', 'content']):
-                            # Recursively check this sub-sitemap
+                        if sub_url:
                             sub_pages = await self._parse_sitemap_urls(sub_url, client)
-                            if sub_pages:
-                                return sub_pages
+                            all_sub_pages.extend(sub_pages)
+                    if all_sub_pages:
+                        return all_sub_pages
 
                 # Parse URLs directly
                 return await self._parse_sitemap_urls(sitemap_url, client, xml_content=response.text)
@@ -374,6 +383,14 @@ class TeamDiscovery:
             if not urls:
                 urls = root.findall('.//url/loc')
 
+            # Skip patterns that indicate non-team pages
+            SKIP_URL_PATTERNS = [
+                '/blog/', '/news/', '/category/', '/tag/', '/author/',
+                '/produkt', '/product', '/shop/', '/karriere/', '/career/',
+                '/datenschutz', '/privacy', '/agb/', '/terms/',
+                '/wp-content/', '/wp-json/', '/feed/',
+            ]
+
             for url_elem in urls:
                 url = url_elem.text
                 if not url:
@@ -381,32 +398,117 @@ class TeamDiscovery:
 
                 url_lower = url.lower()
 
+                # Skip obvious non-team URLs
+                if any(skip in url_lower for skip in SKIP_URL_PATTERNS):
+                    continue
+
                 # Check if URL contains team-related keywords
                 team_keywords = [
-                    'team', 'ueber-uns', 'uber-uns', 'about', 'über-uns',
-                    'kontakt', 'contact', 'ansprechpartner',
-                    'mitarbeiter', 'menschen', 'people', 'staff',
-                    'management', 'fuehrung', 'leadership', 'führung',
-                    'unternehmen', 'company', 'firma', 'wir',
-                    'geschaeftsfuehrung', 'vorstand', 'board',
-                    'who-we-are', 'wer-wir-sind',
+                    '/team', '/unser-team', '/das-team',
+                    '/ueber-uns', '/uber-uns', '/about-us', '/about/',
+                    '/ansprechpartner', '/people', '/staff',
+                    '/management', '/leadership', '/fuehrung',
+                    '/geschaeftsfuehrung', '/vorstand', '/board',
+                    '/who-we-are', '/wer-wir-sind',
+                    '/mitarbeiter', '/menschen',
+                    # Broader patterns (lower score)
+                    '/ueber-', '/uber-', '/about',
+                    '/unternehmen', '/company', '/firma',
+                    '/kontakt', '/contact',
                 ]
 
                 for keyword in team_keywords:
                     if keyword in url_lower:
                         # Score based on keyword position in list (earlier = more relevant)
-                        score = 0.8 - (team_keywords.index(keyword) * 0.05)
+                        score = 0.9 - (team_keywords.index(keyword) * 0.03)
                         pages.append(DiscoveredPage(
                             url=url,
                             source="sitemap",
-                            relevance_score=score
+                            relevance_score=max(score, 0.1)
                         ))
                         break
 
-            return pages[:5]  # Max 5 from sitemap
+            # If keyword matching found results, return them (sorted by score)
+            if pages:
+                pages.sort(key=lambda x: x.relevance_score, reverse=True)
+                return pages[:5]
+
+            # If keyword matching found 0 results but sitemap has many URLs,
+            # use AI to select the best team/about pages
+            all_urls = [
+                url_elem.text for url_elem in urls
+                if url_elem.text and not any(skip in url_elem.text.lower() for skip in SKIP_URL_PATTERNS)
+            ]
+            if len(all_urls) > 10:
+                logger.info(f"  → No keyword matches in {len(all_urls)} sitemap URLs — trying AI selection")
+                ai_pages = await self._ai_select_best_urls(all_urls)
+                if ai_pages:
+                    return ai_pages
+
+            return pages[:5]  # Fallback (empty)
 
         except Exception as e:
             logger.debug(f"Sitemap parsing failed: {e}")
+            return []
+
+    async def _ai_select_best_urls(
+        self,
+        urls: List[str],
+    ) -> List[DiscoveredPage]:
+        """
+        Use AI (FAST tier) to select the best team/about URLs from a list.
+        Only called when keyword matching fails or is ambiguous.
+        Sends only URL strings (tiny input, very cheap).
+        """
+        try:
+            from clients.llm_client import get_llm_client, ModelTier
+
+            llm = get_llm_client()
+
+            # Only send path portions to save tokens
+            urls_formatted = "\n".join(urls[:50])  # Cap at 50 URLs
+
+            prompt = f"""Wähle aus dieser URL-Liste die 3 URLs, die am wahrscheinlichsten Seiten sind auf denen man Team-Mitglieder, Führungskräfte oder Ansprechpartner findet.
+
+GUTE Seiten: /team, /ueber-uns, /about, /management, /leadership, /ansprechpartner, /people, /unternehmen
+SCHLECHTE Seiten: /blog/..., /news/..., /produkte/..., /jobs/..., /karriere/..., /datenschutz, /agb
+
+URLs:
+{urls_formatted}
+
+Antworte NUR als JSON-Array mit den 3 besten URLs (in Prioritäts-Reihenfolge):
+["https://...", "https://...", "https://..."]
+
+Falls keine passende URL dabei ist: []"""
+
+            result = await llm.call_json(prompt, tier=ModelTier.FAST)
+            try:
+                from utils.cost_tracker import track_llm
+                track_llm("sitemap_selection", tier="flash")
+            except Exception:
+                pass
+
+            if not result or not isinstance(result, list):
+                return []
+
+            pages = []
+            for i, url in enumerate(result[:3]):
+                if isinstance(url, str) and url.startswith("http"):
+                    pages.append(DiscoveredPage(
+                        url=url,
+                        source="sitemap",
+                        relevance_score=0.85 - (i * 0.05)
+                    ))
+
+            if pages:
+                logger.info(f"  ✓ AI selected {len(pages)} URL(s) from sitemap")
+                for p in pages:
+                    logger.info(f"    → {p.url}")
+
+            return pages
+
+        except Exception as e:
+            logger.debug(f"AI sitemap selection failed: {e}")
             return []
 
     async def _scan_homepage_links(self, base_url: str) -> List[DiscoveredPage]:
@@ -481,7 +583,9 @@ class TeamDiscovery:
         self,
         url: str,
         company_name: str,
-        target_titles: Optional[List[str]] = None
+        target_titles: Optional[List[str]] = None,
+        job_category: Optional[str] = None,
+        company_domain: Optional[str] = None
     ) -> List[ExtractedContact]:
         """
         Scrape a team page with improved Playwright settings.
@@ -490,53 +594,52 @@ class TeamDiscovery:
         - Longer wait times for JS SPAs
         - Team-specific selector waiting
         - Full page scroll to trigger lazy loading
-        - Multiple scroll passes
+        - Structured text extraction preserving card layouts
         """
-        html = await self._scrape_with_playwright_v2(url)
+        result = await self._scrape_with_playwright_v2(url)
+        html = None
+        visible_text = ""
 
-        if not html:
+        if isinstance(result, tuple):
+            html, visible_text = result
+        elif isinstance(result, str):
+            html = result
+
+        if not html and not visible_text:
             logger.warning(f"⚠️ Playwright scrape failed, trying httpx fallback")
             html = await self._scrape_with_httpx(url)
 
-        if not html:
+        if not html and not visible_text:
             logger.warning(f"❌ All scraping methods failed for {url}")
             return []
 
-        # Parse and extract text
-        soup = BeautifulSoup(html, "lxml")
+        # Parse HTML for card detection
+        card_header = ""
+        if html:
+            soup = BeautifulSoup(html, "lxml")
+            for elem in soup(["script", "style", "noscript", "svg", "iframe"]):
+                elem.decompose()
+            card_header = self._try_extract_cards(soup)
 
-        # Log raw body size
-        body = soup.find('body')
-        if body:
-            raw_text = body.get_text(separator=" ", strip=True)
-            logger.info(f"📄 Raw body text: {len(raw_text)} chars")
+        # Use visible text from Playwright (most reliable) or fall back to HTML extraction
+        if visible_text and len(visible_text) > 100:
+            logger.info(f"📄 Using Playwright visible text: {len(visible_text)} chars")
+            text = visible_text
+        elif html:
+            soup = BeautifulSoup(html, "lxml")
+            for elem in soup(["script", "style", "nav", "noscript", "svg", "iframe"]):
+                elem.decompose()
+            text = self._extract_markdown_text(soup)
+            logger.info(f"📄 Using HTML extracted text: {len(text)} chars")
+        else:
+            text = ""
 
-        # Remove non-content elements
-        for elem in soup(["script", "style", "nav", "noscript", "svg", "iframe"]):
-            elem.decompose()
-
-        # Try to find team-specific sections first
-        text = ""
-        team_sections = soup.select(', '.join([
-            "[class*='team']", "[class*='mitarbeiter']", "[class*='employee']",
-            "[class*='people']", "[class*='staff']", "[class*='member']",
-            "[id*='team']", "[id*='mitarbeiter']", "[id*='about']",
-            "main", "article", ".content", "#content"
-        ]))
-
-        if team_sections:
-            section_texts = []
-            for section in team_sections[:5]:  # Max 5 sections
-                section_text = section.get_text(separator="\n", strip=True)
-                if len(section_text) > 50:
-                    section_texts.append(section_text)
-            text = "\n\n".join(section_texts)
-            logger.info(f"📦 Extracted from {len(team_sections)} team section(s): {len(text)} chars")
-
-        # Fallback to full body if sections didn't yield much
-        if len(text) < 200:
-            text = soup.get_text(separator="\n", strip=True)
-            logger.info(f"📦 Fallback to full body: {len(text)} chars")
+        # Prepend card markers if found
+        if card_header and text:
+            logger.info(f"📦 Card patterns found: {len(card_header)} chars + visible text")
+            text = card_header + "\n\n--- VOLLTEXT ---\n\n" + text
+        elif text:
+            logger.info(f"📦 Text: {len(text)} chars")
 
         # Truncate if needed
         if len(text) > MAX_TEXT_EXTRACT:
@@ -549,10 +652,128 @@ class TeamDiscovery:
             return []
 
         # Use AI to extract contacts
-        logger.info(f"🤖 Running AI contact extraction...")
-        return await extract_contacts_from_page(text, company_name, "team", target_titles=target_titles)
+        logger.info(f"🤖 Running AI contact extraction on {len(text)} chars...")
+        return await extract_contacts_from_page(
+            text, company_name, "team",
+            target_titles=target_titles,
+            job_category=job_category,
+            company_domain=company_domain
+        )
 
-    async def _scrape_with_playwright_v2(self, url: str) -> Optional[str]:
+    def _extract_structured_text(self, soup: BeautifulSoup) -> str:
+        """
+        Extract text from HTML with structure preservation.
+        Full text is ALWAYS preserved — card markers are a bonus prefix.
+
+        Strategy:
+        1. Try to detect card patterns → ---PERSON--- markers as prefix
+        2. Always extract full text with markdown formatting
+        3. Fallback to plain get_text() if markdown extraction fails
+        """
+        # Stufe 1: Try card pattern detection as bonus header
+        card_header = self._try_extract_cards(soup)
+
+        # Stufe 2: Markdown-formatted full text (always)
+        full_text = self._extract_markdown_text(soup)
+
+        if not full_text or len(full_text) < 100:
+            # Stufe 3: Fallback to plain text
+            full_text = soup.get_text(separator="\n", strip=True)
+            logger.info(f"📦 Fallback to plain text: {len(full_text)} chars")
+
+        if card_header:
+            logger.info(f"📦 Card patterns found + full text: {len(card_header)} + {len(full_text)} chars")
+            return card_header + "\n\n--- VOLLTEXT ---\n\n" + full_text
+
+        logger.info(f"📦 Markdown-formatted text: {len(full_text)} chars")
+        return full_text
+
+    def _try_extract_cards(self, soup: BeautifulSoup) -> str:
+        """
+        Try to detect repeating card/profile patterns in the HTML.
+        Returns ---PERSON--- separated blocks if found, empty string otherwise.
+        """
+        CARD_SELECTORS = [
+            # Specific team card classes
+            ".team-member", ".team-card", ".person-card", ".employee-card",
+            ".mitarbeiter", ".staff-member", ".member-card", ".ansprechpartner",
+            # Grid/list children with team-related parents
+            "[class*='team'] > div", "[class*='team'] > li",
+            "[class*='people'] > div", "[class*='staff'] > div",
+            "[class*='member'] > div", "[class*='mitarbeiter'] > div",
+            # CMS-specific patterns
+            ".elementor-team-member", ".wp-block-team > div",
+            ".et_pb_team_member", ".avia-team-member",
+            # Generic patterns (checked last, more cautious)
+            "[class*='person'] > div", "[class*='profile'] > div",
+        ]
+
+        for selector in CARD_SELECTORS:
+            try:
+                cards = soup.select(selector)
+            except Exception:
+                continue
+
+            if len(cards) < 2:
+                continue
+
+            blocks = []
+            for card in cards:
+                card_text = card.get_text(separator="\n", strip=True)
+                # Valid person card: 10-500 chars (too short = empty, too long = not a card)
+                if 10 < len(card_text) < 500:
+                    blocks.append(f"---PERSON---\n{card_text}")
+
+            if len(blocks) >= 2:
+                logger.info(f"  ✓ Card pattern found: {selector} ({len(blocks)} cards)")
+                return "\n\n".join(blocks)
+
+        return ""
+
+    def _extract_markdown_text(self, soup: BeautifulSoup) -> str:
+        """
+        Extract full text from HTML with light structure preservation.
+        Uses get_text() for reliability but enhances with heading/bold markers.
+        Always uses full body to avoid missing content in partial containers.
+        """
+        container = soup.find('body') or soup
+
+        if not container:
+            return ""
+
+        # Also remove footer (usually has no team info, just legal text)
+        for footer in container.find_all('footer'):
+            footer.decompose()
+
+        # Enhance HTML with markers before get_text()
+        for heading in container.find_all(['h1', 'h2', 'h3', 'h4', 'h5', 'h6']):
+            level = int(heading.name[1])
+            heading.insert_before(f"\n{'#' * level} ")
+            heading.insert_after("\n")
+
+        for bold in container.find_all(['strong', 'b']):
+            bold.insert_before("**")
+            bold.insert_after("**")
+
+        for link in container.find_all('a', href=True):
+            href = link.get('href', '')
+            if href.startswith('mailto:'):
+                email = href.replace('mailto:', '').split('?')[0]
+                link.insert_after(f" ({email})")
+            elif href.startswith('tel:'):
+                phone = href.replace('tel:', '')
+                link.insert_after(f" ({phone})")
+
+        # Extract text with newline separator
+        text = container.get_text(separator="\n", strip=True)
+
+        # Clean up excessive blank lines
+        while "\n\n\n" in text:
+            text = text.replace("\n\n\n", "\n\n")
+
+        return text.strip()
+
+    async def _scrape_with_playwright_v2(self, url: str) -> Optional[Tuple[str, str]]:
         """
         Improved Playwright scraping for JS-heavy team pages.
 
@@ -635,14 +856,25 @@ class TeamDiscovery:
                     logger.info(f"  → Scrolling page to load lazy content...")
                     await self._full_page_scroll(page)
 
-                    # Get final content
-                    html = await page.content()
-                    logger.info(f"  ✓ Got {len(html)} bytes HTML")
+                    # Get both HTML (for card detection) and visible text (reliable)
+                    try:
+                        html = await page.evaluate("document.body ? document.body.innerHTML : document.documentElement.outerHTML")
+                    except Exception:
+                        html = await page.content()
+
+                    # Get visible text directly from Playwright (most reliable)
+                    try:
+                        visible_text = await page.inner_text('body')
+                    except Exception:
+                        visible_text = ""
+
+                    logger.info(f"  ✓ Got {len(html)} bytes HTML, {len(visible_text)} chars visible text")
 
                     if len(html) > MAX_PAGE_SIZE:
                         html = html[:MAX_PAGE_SIZE]
 
-                    return html
+                    # Return both as tuple (html, visible_text)
+                    return (html, visible_text)
 
                 finally:
                     await browser.close()

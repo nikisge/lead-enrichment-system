@@ -680,6 +680,7 @@ async def _enrich_lead_inner(
                     "name": contact.name,
                     "email": contact.email,
                     "title": contact.title,
+                    "phone": contact.phone,
                     "source": team_source,
                     "priority": team_priority
                 })

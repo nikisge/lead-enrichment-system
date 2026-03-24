@@ -321,7 +321,10 @@ async def validate_and_rank_candidates(
     filtered_candidates = []
     for c in candidates:
         name = c.get("name", "").strip()
-        if name and len(name) >= 3 and len(name.split()) >= 2:
+        title = c.get("title", "")
+        # Full names (2+ words) always pass. Single names pass if they have a title
+        # (some team pages only show first names, e.g. "Thomas - Teamleiter IT")
+        if name and len(name) >= 2 and (len(name.split()) >= 2 or title):
             filtered_candidates.append(c)
 
     if not filtered_candidates:
@@ -344,7 +347,7 @@ Prüfe für JEDEN Kandidaten:
 
 1. name_valid: Ist der Name ein echter Personenname?
    - UNGÜLTIG: Überschriften, Menüpunkte, Platzhalter, Firmennamen
-   - GÜLTIG: Echte Vor- und Nachnamen
+   - GÜLTIG: Echte Vor- und Nachnamen (auch nur Vornamen wenn mit Titel/Position)
 
 2. email_valid: Gehört die E-Mail zur Firma?
    - GÜLTIG: Gleiche Domain, Subdomain, Mutter-/Tochterfirma
@@ -360,7 +363,11 @@ Prüfe für JEDEN Kandidaten:
    HINWEIS: Geschäftsführer/CEO aus dem Impressum sind nur ein Backup.
    Selbst wenn sie eine Telefonnummer haben, sollen Fachbereich- und HR-Kontakte bevorzugt werden.
 
-4. overall_valid: true wenn name_valid UND (keine E-Mail ODER email_valid)
+   REGION: Wir suchen Ansprechpartner im DACH-Raum (Deutschland/Österreich/Schweiz).
+   Wenn aus dem Titel/Position klar hervorgeht, dass jemand in einer anderen Region arbeitet
+   (z.B. "Manager Indonesia", "Head of APAC", "Director US Operations"), dann: relevance_score = 0, overall_valid = false.
+
+4. overall_valid: true wenn name_valid UND (keine E-Mail ODER email_valid) UND DACH-Region
 
 Antworte als JSON-Array, sortiert nach relevance_score (höchste zuerst):
 [{{

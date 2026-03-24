@@ -63,7 +63,8 @@ async def extract_contacts_from_page(
     company_name: str,
     page_type: str = "team",
     target_titles: Optional[List[str]] = None,
-    job_category: Optional[str] = None
+    job_category: Optional[str] = None,
+    company_domain: Optional[str] = None
 ) -> List[ExtractedContact]:
     """
     Extract contact persons from any page using AI.
@@ -74,6 +75,7 @@ async def extract_contacts_from_page(
         page_type: Type of page (team, impressum, job_posting, about)
         target_titles: Preferred job titles to prioritize in extraction
         job_category: Job category for context
+        company_domain: Company domain for email validation
 
     Returns:
         List of extracted contacts
@@ -91,31 +93,41 @@ async def extract_contacts_from_page(
     if target_titles:
         titles_str = ', '.join(target_titles[:5])
         priority_hint = f"""
-
 PRIORITÄT: Wir suchen bevorzugt Personen mit folgenden Titeln/Rollen: {titles_str}
-Sortiere die Ergebnisse so, dass Personen mit passenden Titeln zuerst kommen.
-NICHT suchen: HR-Manager, Personalleiter, Recruiter (für uns irrelevant)."""
+Sortiere die Ergebnisse so, dass Personen mit passenden Titeln zuerst kommen."""
 
-    prompt = f"""Analysiere diesen {page_type}-Text von "{company_name}" und extrahiere alle echten Mitarbeiter/Ansprechpartner.
+    category_context = f"\nKONTEXT: Wir suchen Entscheidungsträger für eine Stelle im Bereich: {job_category}" if job_category else ""
 
-WICHTIG - Extrahiere NUR:
-- Echte Personennamen (Vor- und Nachname)
-- KEINE Überschriften, Menüpunkte oder Platzhalter
+    prompt = f"""Analysiere den folgenden {page_type}-Text von "{company_name}" und extrahiere alle Mitarbeiter/Ansprechpartner.
+{category_context}{priority_hint}
+
+SO LIEST DU DEN TEXT:
+- "---PERSON---" Blöcke: Jeder Block = eine Person. Name ist die erste Zeile/Überschrift.
+- **Fettgedruckte** Texte: Oft Personennamen
+- ## Überschriften: Oft Abteilungen oder Namen
+- "--- VOLLTEXT ---": Ab hier kommt der komplette Seitentext als Kontext
+- Wenn keine Markierungen: Suche nach Name + Titel Mustern im Text
+
+REGELN:
+- Bevorzugt Vor- UND Nachname. Aber: wenn die Seite nur Vornamen zeigt (z.B. "Thomas - Teamleiter IT"), trotzdem extrahieren!
+- KEINE Überschriften, Menüpunkte, Firmennamen, Platzhalter
 - KEINE generischen Texte wie "Unser Team" oder "Kontaktieren Sie uns"
-{priority_hint}
-Für jeden gefundenen Mitarbeiter gib zurück:
+- Titel genau wie auf der Seite übernehmen (z.B. "Leiter IT", "CTO", "Teamleiterin")
+- HR/Recruiting-Kontakte MIT extrahieren (werden später im Ranking eingestuft)
+
+Für jeden Mitarbeiter:
 - name: Vollständiger Name (Vor- und Nachname)
-- title: Position/Jobtitel falls vorhanden (sonst null)
+- title: Position/Jobtitel (genau wie auf der Seite, sonst null)
 - email: E-Mail-Adresse falls vorhanden (sonst null)
 - phone: Telefonnummer falls vorhanden (sonst null)
 
 Text:
 {text}
 
-Antworte als JSON-Array:
+JSON-Array sortiert nach Relevanz für "{job_category or 'die Stelle'}":
 [{{"name": "Max Müller", "title": "Geschäftsführer", "email": "m.mueller@firma.de", "phone": null}}]
 
-Falls keine echten Personen gefunden werden: []"""
+Falls keine echten Personen gefunden: []"""
 
     result = await llm.call_json(prompt, tier=ModelTier.BALANCED)
     track_llm("contact_extract", tier="sonnet")  # Contact extraction uses Sonnet
@@ -133,11 +145,12 @@ Falls keine echten Personen gefunden werden: []"""
             continue
 
         name = item.get("name", "").strip()
-        if not name or len(name) < 3:
+        if not name or len(name) < 2:
             continue
 
-        # Basic validation: name should have at least 2 words
-        if len(name.split()) < 2:
+        # Prefer full names (2+ words), but accept single names when they have a title
+        title = item.get("title", "")
+        if len(name.split()) < 2 and not title:
             continue
 
         contacts.append(ExtractedContact(
